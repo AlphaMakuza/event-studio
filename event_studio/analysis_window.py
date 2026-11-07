@@ -172,8 +172,8 @@ class SpatialPlotWindow(QWidget):
             if self._mode == "raw":
                 ax.scatter(xs, ys, s=1)
             else:
-                if ts.size > 1 and float(ts.max()) > float(ts.min()):
-                    t_norm = (ts.astype(np.float64) - float(ts.min())) / (float(ts.max()) - float(ts.min()))
+                if ts.size > 1 and int(ts.max()) > int(ts.min()):
+                    t_norm = (ts - int(ts.min())).astype(np.float64) / (int(ts.max()) - int(ts.min()))
                 else:
                     t_norm = np.zeros_like(ts, dtype=np.float64)
 
@@ -347,6 +347,8 @@ class ROIAnalysisPanel(QWidget):
         if events is None or events.t.size == 0:
             return (0, 0, 0)
         return (
+            id(events),
+            events.metadata.get("sha256"),
             int(events.t.size),
             int(events.t[0]),
             int(events.t[-1]),
@@ -434,7 +436,7 @@ class ROIAnalysisPanel(QWidget):
         canvas = np.zeros((h, w, 3), dtype=np.float32)
 
         if xs.size > 0:
-            progressive_mask = ts <= int(current_t_end_us)
+            progressive_mask = ts < int(current_t_end_us)
             xs = xs[progressive_mask]
             ys = ys[progressive_mask]
             ts = ts[progressive_mask]
@@ -446,11 +448,11 @@ class ROIAnalysisPanel(QWidget):
                     ys = ys[::step]
                     ts = ts[::step]
 
-                t_min = float(ts.min())
-                t_max = float(ts.max())
+                t_min = int(ts.min())
+                t_max = int(ts.max())
 
                 if t_max > t_min:
-                    t_norm = (ts.astype(np.float32) - t_min) / (t_max - t_min)
+                    t_norm = (ts - t_min).astype(np.float64) / (t_max - t_min)
                 else:
                     t_norm = np.zeros_like(ts, dtype=np.float32)
 
@@ -583,20 +585,21 @@ class ROIAnalysisPanel(QWidget):
         self.subtitle_label.setText(
             f"Project: {project_name}\n"
             f"Source: {loaded_name}\n"
-            f"ROI box: x={roi.x} y={roi.y} w={roi.w} h={roi.h} | color={roi_color}"
+            f"ROI box: x={roi.x} y={roi.y} w={roi.w} h={roi.h} | color={roi_color}\n"
+            "Unfiltered analysis. DERIVED heatmap: full recording, log-relative scale.\n"
+            "DERIVED trail: history through playhead, time color and log-relative scale.\n"
+            f"Spatial/trail presentations use at most {self.MAX_SPATIAL_POINTS:,} sampled events; statistics and CSV exports use every selected event."
         )
 
         full_t0 = int(events.t.min())
         full_t1 = int(events.t.max())
         full_window_us = max(1, full_t1 - full_t0 + 1)
 
-        full_stats = compute_roi_stats(
-            events=events,
-            hw=hw,
-            roi=roi,
-            t0_us=full_t0,
-            window_us=full_window_us,
-        )
+        stats_key = (self._events_key(events), self._roi_key(roi))
+        if getattr(self, "_full_stats_key", None) != stats_key:
+            self._full_stats_key = stats_key
+            self._full_stats = compute_roi_stats(events, hw, roi, full_t0, full_window_us)
+        full_stats = self._full_stats
 
         curr_stats = compute_roi_stats(
             events=events,
@@ -663,6 +666,8 @@ class ROIAnalysisPanel(QWidget):
             )
             self._last_trail_update_walltime = 0.0
             self._last_trail_playhead_us = None
+            self._last_plot_payload = self._build_activity_plot_payload(
+                events, roi, roi_name, loaded_name, current_t_end_us)
 
         if self._cached_heatmap_rgb is not None:
             self._last_heatmap_rgb = self._cached_heatmap_rgb

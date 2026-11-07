@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -65,12 +67,15 @@ def preview_dir(project_dir: Path) -> Path:
 def _save_gray_png(frame: np.ndarray, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    arr = np.ascontiguousarray(frame)
-    if arr.ndim != 2:
-        raise ValueError("Expected a 2D grayscale frame.")
-
-    h, w = arr.shape
-    qimg = QImage(arr.data, w, h, arr.strides[0], QImage.Format_Grayscale8).copy()
+    arr = np.ascontiguousarray(frame, dtype=np.uint8)
+    if arr.ndim == 2:
+        fmt = QImage.Format_Grayscale8
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        fmt = QImage.Format_RGB888
+    else:
+        raise ValueError("Expected an HxW grayscale or HxWx3 RGB frame.")
+    h, w = arr.shape[:2]
+    qimg = QImage(arr.data, w, h, arr.strides[0], fmt).copy()
     if not qimg.save(str(out_path)):
         raise RuntimeError(f"Failed to save image: {out_path}")
 
@@ -78,18 +83,18 @@ def _save_gray_png(frame: np.ndarray, out_path: Path) -> None:
 def save_preview_frames(project_dir: Path, frames: list[np.ndarray]) -> list[str]:
     pdir = preview_dir(project_dir)
     pdir.mkdir(parents=True, exist_ok=True)
-
-    for old in pdir.glob("*.png"):
-        try:
-            old.unlink()
-        except Exception:
-            pass
-
     saved = []
-    for i, frame in enumerate(frames):
-        out = pdir / f"frame_{i:02d}.png"
-        _save_gray_png(frame, out)
-        saved.append(out.name)
+    with tempfile.TemporaryDirectory(prefix="previews-", dir=project_dir) as temporary:
+        staging = Path(temporary)
+        for i, frame in enumerate(frames):
+            out = staging / f"frame_{i:02d}.png"
+            _save_gray_png(frame, out)
+            saved.append(out.name)
+        for name in saved:
+            os.replace(staging / name, pdir / name)
+    for old in pdir.glob("*.png"):
+        if old.name not in saved:
+            old.unlink()
     return saved
 
 
@@ -105,8 +110,14 @@ def load_json(path: Path, default: Any = None) -> Any:
 
 def save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    fd, tmp = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def save_project_bundle(
@@ -118,12 +129,13 @@ def save_project_bundle(
 ) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    save_json(session_json_path(project_dir), session_data)
-
     if thumbnail_frame is not None:
         _save_gray_png(thumbnail_frame, thumbnail_path(project_dir))
 
     preview_files = save_preview_frames(project_dir, preview_frames) if preview_frames else []
+
+    # Commit analysis state only after image generation succeeds.
+    save_json(session_json_path(project_dir), session_data)
 
     meta_old = load_json(metadata_json_path(project_dir), default={}) or {}
     meta = {

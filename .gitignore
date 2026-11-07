@@ -7,3 +7,4 @@ projects/
 *.h5
 *.dat
 .pytest_cache/
+artifacts/

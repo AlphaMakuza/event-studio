@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -26,6 +26,7 @@ class EventBatch:
     x: np.ndarray  # int32
     y: np.ndarray  # int32
     p: np.ndarray  # int8  (0/1 or -1/1 depending on exporter)
+    metadata: dict = field(default_factory=dict)
 
 
 def _wsl_base_cmd() -> list[str]:
@@ -121,64 +122,15 @@ def h5_to_csv_windows(
     return out_csv
 
 
-def load_events_from_csv(csv_path: str | Path, max_events: int = 2_000_000) -> EventBatch:
-    """
-    Loads OpenEB CSV (columns typically: t,x,y,p or x,y,p,t depending on version).
-    We'll detect by header. Reads up to max_events rows.
-    """
-    csv_path = Path(csv_path).resolve()
-    if not csv_path.exists():
-        raise FileNotFoundError(csv_path)
-
-    # Read header
-    with csv_path.open("r", encoding="utf-8", errors="ignore") as f:
-        header = f.readline().strip()
-
-    # Load numeric data
-    data = np.genfromtxt(
-        csv_path,
-        delimiter=",",
-        skip_header=1,
-        max_rows=int(max_events),
-    )
-
-    if data.size == 0:
-        return EventBatch(
-            t=np.array([], dtype=np.int64),
-            x=np.array([], dtype=np.int32),
-            y=np.array([], dtype=np.int32),
-            p=np.array([], dtype=np.int8),
-        )
-
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-
-    # Detect column order
-    h = header.lower().replace(" ", "")
-    cols = [c.strip() for c in h.split(",")]
-
-    if "t" in cols and "x" in cols and "y" in cols and "p" in cols:
-        idx_t = cols.index("t")
-        idx_x = cols.index("x")
-        idx_y = cols.index("y")
-        idx_p = cols.index("p")
-    else:
-        # fallback guess if no header
-        # assume x,y,p,t
-        idx_x, idx_y, idx_p, idx_t = 0, 1, 2, 3
-
-    t = data[:, idx_t].astype(np.int64, copy=False)
-    x = data[:, idx_x].astype(np.int32, copy=False)
-    y = data[:, idx_y].astype(np.int32, copy=False)
-
-    # p can come out as floats from genfromtxt -> cast safely
-    p_raw = data[:, idx_p]
-    p = p_raw.astype(np.int8, copy=False)
-
-    return EventBatch(t=t, x=x, y=y, p=p)
+def load_events_from_csv(csv_path: str | Path, max_events: int | None = None) -> EventBatch:
+    from .science import load_csv
+    return load_csv(csv_path, max_events)
 
 
 def infer_hw(events: EventBatch) -> Tuple[int, int]:
+    if events.metadata.get("resolution"):
+        w, h = events.metadata["resolution"]
+        return (h, w)
     w = int(events.x.max()) + 1 if events.x.size else 0
     h = int(events.y.max()) + 1 if events.y.size else 0
     if w <= 0 or h <= 0:
@@ -201,7 +153,7 @@ def accumulate_frame(
     - t_start_us: if None, uses earliest t in events
     """
     h, w = hw
-    img16 = np.zeros((h, w), dtype=np.uint16)
+    img16 = np.zeros((h, w), dtype=np.uint64)
 
     if events.t.size == 0:
         return np.zeros((h, w), dtype=np.uint8)
@@ -243,7 +195,7 @@ class RoiStats:
     events_per_ms: float
     pos: int
     neg: int
-    polarity_ratio: float  # pos / max(1, neg)
+    polarity_ratio: float  # pos / neg; +inf for positive-only, 0 for empty
     active_pixels: int
 
 
@@ -257,18 +209,9 @@ def compute_roi_stats(events, hw, roi, t0_us: int, window_us: int) -> RoiStats:
 
     t1_us = t0_us + int(window_us)
 
-    # time window mask
-    m = (events.t >= t0_us) & (events.t < t1_us)
-
-    # roi mask
-    x0, y0 = int(roi.x), int(roi.y)
-    x1, y1 = x0 + int(roi.w), y0 + int(roi.h)
-
-    m &= (events.x >= x0) & (events.x < x1) & (events.y >= y0) & (events.y < y1)
-
-    xs = events.x[m]
-    ys = events.y[m]
-    ps = events.p[m]
+    from .science import select
+    batch = select(events, t0_us, t1_us, roi)
+    xs, ys, ps = batch.x, batch.y, batch.p
 
     n = int(xs.size)
     if n == 0:
@@ -285,7 +228,8 @@ def compute_roi_stats(events, hw, roi, t0_us: int, window_us: int) -> RoiStats:
     active = int(np.unique(packed).size)
 
     events_per_ms = n / max(1e-9, (window_us / 1000.0))
-    ratio = pos / max(1, neg)
+    from .science import polarity_ratio
+    ratio = polarity_ratio(pos, neg)
 
     return RoiStats(
         n_events=n,

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import csv
 import json
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from uuid import uuid4
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -30,13 +30,20 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QLineEdit,
+    QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
+from .science import select, export_csv, polarity_ratio
+from . import rendering
+from .workers import Task
 
 from .convert import convert_dat_to_h5_windows, h5_to_csv_windows
 from .viewer import (
     load_events_from_csv,
     infer_hw,
-    accumulate_frame,
     compute_roi_stats,
 )
 from .roi_label import ROILabel, Roi
@@ -57,7 +64,7 @@ from .timeline_slider import TimelineSlider
 def _try_show_boot(app: QApplication) -> None:
     try:
         from .boot import show_boot  # type: ignore
-        show_boot(app)  # type: ignore
+        app.boot_overlay = show_boot(app)  # keep startup/audio alive
     except Exception:
         return
 
@@ -88,6 +95,8 @@ VIEW_MODE_RAW = "RAW"
 VIEW_MODE_HEATMAP = "HEATMAP"
 VIEW_MODE_TRAIL = "TRAIL"
 VIEW_MODE_MOTION_ARROWS = "MOTION ARROWS"
+VIEW_MODE_PERSISTENCE = "PERSISTENCE TRAILS"
+VIEW_MODE_GLOW = "POLARITY GLOW"
 
 
 @dataclass
@@ -96,6 +105,7 @@ class NamedROI:
     roi: Roi
     visible: bool = True
     color: str = "#ff3b30"
+    id: str = field(default_factory=lambda: uuid4().hex)
 
 
 @dataclass
@@ -105,6 +115,11 @@ class Slice:
     t1: int
     roi_index: Optional[int] = None
     color: str = "#34c759"
+    id: str = field(default_factory=lambda: uuid4().hex)
+    roi_id: Optional[str] = None
+    roi_snapshot: Optional[dict] = None
+    polarity: str = "both"
+    source_sha256: str = ""
 
 
 class MainWindow(QMainWindow):
@@ -144,6 +159,12 @@ class MainWindow(QMainWindow):
 
         self.current_frame: Optional[np.ndarray] = None
         self.current_view_mode: str = VIEW_MODE_RAW
+        self.position_us = 0
+        self.duration_us = 50_000
+        self.zoom_start = 0
+        self.zoom_end = 1
+        self._task = None
+        self._restoring = False
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -156,15 +177,33 @@ class MainWindow(QMainWindow):
         root.addLayout(top, stretch=1)
 
         self.view = ROILabel()
-        self.view.setMinimumSize(760, 500)
+        self.view.setMinimumSize(360, 300)
         self.view.set_help_text("File → Import .dat to preview")
         self.view.roiChanged.connect(self._on_candidate_roi_changed)
         self.view.roiMoved.connect(self._on_active_roi_moved)
-        top.addWidget(self.view, stretch=5)
+        self.compare_view = ROILabel()
+        self.compare_view.setMinimumSize(300, 300)
+        self.compare_view.roiChanged.connect(self._on_candidate_roi_changed)
+        self.compare_view.roiMoved.connect(self._on_active_roi_moved)
+        self.compare_box = QGroupBox("RAW • unfiltered reference")
+        compare_layout = QVBoxLayout(self.compare_box)
+        compare_layout.addWidget(self.compare_view)
+        self.compare_box.hide()
+        top.addWidget(self.compare_box, stretch=3)
+        self.view_box = QGroupBox("RAW • scientific view")
+        viewer_layout = QVBoxLayout(self.view_box)
+        viewer_layout.addWidget(self.view)
+        top.addWidget(self.view_box, stretch=3)
 
         self.middle_panel = QVBoxLayout()
         self.middle_panel.setSpacing(10)
-        top.addLayout(self.middle_panel, stretch=2)
+        sidebar = QWidget()
+        sidebar.setLayout(self.middle_panel)
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setWidget(sidebar)
+        sidebar_scroll.setMinimumWidth(350)
+        top.addWidget(sidebar_scroll, stretch=2)
 
         # -------------------------
         # Studio View
@@ -178,6 +217,8 @@ class MainWindow(QMainWindow):
             VIEW_MODE_RAW,
             VIEW_MODE_HEATMAP,
             VIEW_MODE_TRAIL,
+            VIEW_MODE_PERSISTENCE,
+            VIEW_MODE_GLOW,
             VIEW_MODE_MOTION_ARROWS,
         ])
         self.view_mode_combo.currentTextChanged.connect(self._on_view_mode_changed)
@@ -191,6 +232,40 @@ class MainWindow(QMainWindow):
         )
         self.view_mode_hint.setWordWrap(True)
         view_layout.addWidget(self.view_mode_hint)
+        self.polarity_combo = QComboBox()
+        self.polarity_combo.addItems(["both", "pos", "neg"])
+        polarity_label = QLabel("Non-destructive polarity filter (view, window stats, new slices)")
+        polarity_label.setWordWrap(True)
+        view_layout.addWidget(polarity_label)
+        view_layout.addWidget(self.polarity_combo)
+        self.polarity_combo.currentTextChanged.connect(self._render_from_ui)
+        self.polarity_combo.setToolTip("both = all events; pos = positive; neg = negative. The source recording remains unchanged.")
+        self.compare_check = QCheckBox("Compare with unfiltered RAW")
+        self.compare_check.toggled.connect(self._toggle_comparison)
+        view_layout.addWidget(self.compare_check)
+        self.persistence_ms = QDoubleSpinBox()
+        self.persistence_ms.setRange(0.001, 60000)
+        self.persistence_ms.setDecimals(3)
+        self.persistence_ms.setValue(100)
+        self.persistence_ms.setSuffix(" ms")
+        self.persistence_ms.valueChanged.connect(self._render_from_ui)
+        self.persistence_label = QLabel("Persistence duration • linear decay")
+        view_layout.addWidget(self.persistence_label)
+        view_layout.addWidget(self.persistence_ms)
+        self.glow_intensity = QDoubleSpinBox()
+        self.glow_intensity.setRange(0, 3)
+        self.glow_intensity.setSingleStep(0.1)
+        self.glow_intensity.setValue(0.7)
+        self.glow_label = QLabel("Glow intensity • 5×5 spatial halo")
+        view_layout.addWidget(self.glow_label)
+        self.glow_intensity.valueChanged.connect(self._render_from_ui)
+        view_layout.addWidget(self.glow_intensity)
+        self.heat_scale = QComboBox()
+        self.heat_scale.addItems(["Log relative", "Linear relative", "Absolute (100 events/pixel)"])
+        self.heat_scale.currentTextChanged.connect(self._render_from_ui)
+        self.heat_label = QLabel("Heatmap normalization")
+        view_layout.addWidget(self.heat_label)
+        view_layout.addWidget(self.heat_scale)
 
         arrow_row1 = QHBoxLayout()
         arrow_row1.addWidget(QLabel("Grid"))
@@ -225,6 +300,8 @@ class MainWindow(QMainWindow):
         self.arrow_silhouette_spin.valueChanged.connect(self._render_from_ui)
         arrow_row2.addWidget(self.arrow_silhouette_spin)
         view_layout.addLayout(arrow_row2)
+        self.arrow_widgets = [layout.itemAt(i).widget() for layout in (arrow_row1, arrow_row2)
+                              for i in range(layout.count())]
 
         self.middle_panel.addWidget(view_box)
 
@@ -329,6 +406,12 @@ class MainWindow(QMainWindow):
         self.slice_list.itemSelectionChanged.connect(self._on_slice_selection_changed)
         self.slice_list.itemDoubleClicked.connect(self._jump_to_selected_slice)
         slice_layout.addWidget(self.slice_list)
+        edit_bounds = QPushButton("Use exact current interval for selected slice")
+        edit_bounds.clicked.connect(self._edit_slice_bounds)
+        slice_layout.addWidget(edit_bounds)
+        self.slice_stats = QLabel("Select a slice to inspect its saved interval.")
+        self.slice_stats.setWordWrap(True)
+        slice_layout.addWidget(self.slice_stats)
 
         slice_edit_row = QHBoxLayout()
         self.btn_rename_slice = QPushButton("Rename Slice")
@@ -390,6 +473,13 @@ class MainWindow(QMainWindow):
             stats_layout.addWidget(lab)
 
         self.middle_panel.addWidget(stats_box)
+        self.roi_table = QTableWidget(0, 5)
+        self.roi_table.setHorizontalHeaderLabels(["ROI", "Events", "+ / −", "ev/ms", "Pixels"])
+        self.roi_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.roi_table.setMinimumHeight(170)
+        self.roi_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        stats_layout.addWidget(QLabel("All ROI probes • current interval and polarity filter"))
+        stats_layout.addWidget(self.roi_table)
         self.middle_panel.addStretch(1)
 
         self.analysis_panel = ROIAnalysisPanel()
@@ -411,10 +501,10 @@ class MainWindow(QMainWindow):
 
         controls.addWidget(QLabel("Time"))
         self.timeline = TimelineSlider(Qt.Horizontal)
-        self.timeline.setRange(0, 1000)
+        self.timeline.setRange(0, 1_000_000)
         self.timeline.setValue(0)
         self.timeline.setEnabled(False)
-        self.timeline.valueChanged.connect(self._render_from_ui)
+        self.timeline.valueChanged.connect(self._on_timeline_changed)
         self.timeline.sliceSelected.connect(self._on_timeline_slice_selected)
         self.timeline.sliceEdited.connect(self._on_timeline_slice_edited)
         controls.addWidget(self.timeline, stretch=1)
@@ -423,13 +513,45 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.time_label)
 
         controls.addWidget(QLabel("Window:"))
-        self.window_ms = QSpinBox()
-        self.window_ms.setRange(1, 5000)
+        self.window_ms = QDoubleSpinBox()
+        self.window_ms.setDecimals(3)
+        self.window_ms.setRange(0.001, 1_000_000_000)
         self.window_ms.setValue(50)
         self.window_ms.setSuffix(" ms")
         self.window_ms.setEnabled(False)
-        self.window_ms.valueChanged.connect(self._render_from_ui)
+        self.window_ms.valueChanged.connect(self._on_window_changed)
         controls.addWidget(self.window_ms)
+
+        precise = QHBoxLayout()
+        root.addLayout(precise)
+        self.start_edit = QLineEdit("0")
+        self.end_edit = QLineEdit("50000")
+        self.start_edit.setMaximumWidth(190)
+        self.end_edit.setMaximumWidth(190)
+        precise.addWidget(QLabel("Start µs"))
+        precise.addWidget(self.start_edit)
+        precise.addWidget(QLabel("End µs (exclusive)"))
+        precise.addWidget(self.end_edit)
+        apply_time = QPushButton("Apply interval")
+        apply_time.clicked.connect(self._apply_interval)
+        precise.addWidget(apply_time)
+        self.step_us = QSpinBox()
+        self.step_us.setRange(1, 1_000_000_000)
+        self.step_us.setValue(1000)
+        self.step_us.setSuffix(" µs / tick")
+        precise.addWidget(self.step_us)
+        for label, delta, shortcut in (("Step back", -1, "Left"), ("Step forward", 1, "Right")):
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, d=delta: self._step(d))
+            precise.addWidget(button)
+            action = QAction(label, self)
+            action.setShortcut(shortcut)
+            action.triggered.connect(lambda checked=False, d=delta: self._step(d))
+            self.addAction(action)
+        for label, handler in (("Zoom to interval", self._zoom_interval), ("Full timeline", self._zoom_full)):
+            button = QPushButton(label)
+            button.clicked.connect(handler)
+            precise.addWidget(button)
 
         # -------------------------
         # Menu
@@ -439,8 +561,20 @@ class MainWindow(QMainWindow):
         import_action = QAction("Import .dat", self)
         import_action.triggered.connect(self.on_import_dat_clicked)
         file_menu.addAction(import_action)
+        for label, handler in (("Open CSV / H5", self._open_recording),
+                               ("Export full recording CSV", self._export_full),
+                               ("Export current selection CSV", self._export_current),
+                               ("Save Session As…", self._save_session_as),
+                               ("Load Session…", self._load_session_dialog)):
+            action = QAction(label, self)
+            action.triggered.connect(handler)
+            file_menu.addAction(action)
+        sensor_action = QAction("Set sensor resolution…", self)
+        sensor_action.triggered.connect(self._set_sensor_resolution)
+        file_menu.addAction(sensor_action)
 
         save_project_action = QAction("Save Project", self)
+        save_project_action.setShortcut("Ctrl+S")
         save_project_action.triggered.connect(self.save_project)
         file_menu.addAction(save_project_action)
 
@@ -456,6 +590,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Ready")
         self._update_window_title()
+        self._update_mode_description()
 
         if self.current_project_dir is not None:
             self._load_project_from_dir(self.current_project_dir)
@@ -463,6 +598,248 @@ class MainWindow(QMainWindow):
     # =========================================================
     # General helpers
     # =========================================================
+    def _run_task(self, function, finished, message="Working…") -> None:
+        if self._task is not None:
+            return
+        if self.is_playing:
+            self._toggle_play()
+        self.centralWidget().setEnabled(False)
+        self.menuBar().setEnabled(False)
+        self.statusBar().showMessage(message)
+        task = Task(function, self)
+        self._task = task
+
+        def success(result):
+            try:
+                finished(result)
+            except Exception as exc:
+                self._restoring = False
+                QMessageBox.critical(self, "Operation failed", str(exc))
+
+        def cleanup():
+            self.centralWidget().setEnabled(True)
+            self.menuBar().setEnabled(True)
+            self._task = None
+            task.deleteLater()
+
+        task.succeeded.connect(success)
+        task.failed.connect(lambda error: QMessageBox.critical(self, "Operation failed", error))
+        task.finished.connect(cleanup)
+        task.start()
+
+    def _open_recording(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open recording", str(self.data_dir),
+                                             "Event recordings (*.csv *.h5)")
+        if not path:
+            return
+
+        def load():
+            source = Path(path)
+            if source.suffix.lower() == ".h5":
+                source = h5_to_csv_windows(source, self.data_dir / "converted" / uuid4().hex[:12] / (source.stem + ".csv"))
+            events = load_events_from_csv(source)
+            if Path(path).suffix.lower() == ".h5":
+                from .science import fingerprint
+                events.metadata.update({"original_path": path, "original_sha256": fingerprint(Path(path)),
+                                        "conversion": "OpenEB H5 → CSV"})
+            return source, events
+
+        self._run_task(load, lambda result: self._load_csv_into_app(result[0], Path(path).stem,
+                                                                   prepared_events=result[1]), "Loading full recording…")
+
+    def _seek(self, timestamp: int) -> None:
+        if self.events is None:
+            return
+        self.position_us = max(self.t_min, min(self.t_max, int(timestamp)))
+        self._render_from_ui()
+
+    def _sync_time_widgets(self) -> None:
+        self.timeline.blockSignals(True)
+        self.timeline.setValue(self._time_us_to_slider_value(self.position_us))
+        self.timeline.blockSignals(False)
+        self.window_ms.blockSignals(True)
+        self.window_ms.setValue(self.duration_us / 1000)
+        self.window_ms.blockSignals(False)
+        self.start_edit.setText(str(self.position_us))
+        self.end_edit.setText(str(self.position_us + self.duration_us))
+
+    def _on_timeline_changed(self, value) -> None:
+        self._seek(self._slider_value_to_time_us(value))
+
+    def _on_window_changed(self, value) -> None:
+        self.duration_us = max(1, int(round(value * 1000)))
+        self._render_from_ui()
+
+    def _apply_interval(self) -> None:
+        if self.events is None:
+            return
+        try:
+            start, end = int(self.start_edit.text()), int(self.end_edit.text())
+            if not (self.t_min <= start <= self.t_max and start < end <= self.t_max + 1):
+                raise ValueError("Use a nonempty interval within the recording; end is exclusive.")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid interval", str(exc))
+            return
+        self.duration_us = end - start
+        self._seek(start)
+
+    def _step(self, direction) -> None:
+        if self.events is not None:
+            if self.is_playing:
+                self._toggle_play()
+            self._seek(self.position_us + direction * self.step_us.value())
+
+    def _zoom_interval(self) -> None:
+        if self.events is not None:
+            self.zoom_start = self.position_us
+            self.zoom_end = min(self.t_max + 1, self.position_us + self.duration_us)
+            self._render_from_ui()
+
+    def _zoom_full(self) -> None:
+        if self.events is not None:
+            self.zoom_start, self.zoom_end = self.t_min, self.t_max + 1
+            self._render_from_ui()
+
+    def _toggle_comparison(self, checked) -> None:
+        self.compare_box.setVisible(checked)
+        self._render_from_ui()
+
+    def _update_mode_description(self) -> None:
+        mode = self.current_view_mode
+        classification = "RAW" if mode == VIEW_MODE_RAW else "STYLIZED" if mode == VIEW_MODE_GLOW else "DERIVED"
+        self.view_box.setTitle(f"{classification} • {mode}")
+        for widget in (self.persistence_label, self.persistence_ms):
+            widget.setVisible(mode == VIEW_MODE_PERSISTENCE)
+        for widget in (self.glow_label, self.glow_intensity):
+            widget.setVisible(mode == VIEW_MODE_GLOW)
+        for widget in (self.heat_label, self.heat_scale):
+            widget.setVisible(mode == VIEW_MODE_HEATMAP)
+        for widget in self.arrow_widgets:
+            widget.setVisible(mode == VIEW_MODE_MOTION_ARROWS)
+        if mode == VIEW_MODE_HEATMAP:
+            batch = select(self.events, *self._current_window(), polarity=self.polarity_combo.currentText())
+            packed = batch.y.astype(np.int64) * self.hw[1] + batch.x
+            self._heat_peak = int(np.bincount(packed).max()) if len(packed) else 0
+        descriptions = {
+            VIEW_MODE_RAW: "RAW • real event presence; no intensity normalization. + orange, − blue, both white.",
+            VIEW_MODE_HEATMAP: f"DERIVED • {self.heat_scale.currentText()}; black = 0, red → yellow → white = increasing density. Window peak: {getattr(self, '_heat_peak', 0)} events/pixel. Relative scales map peak to white; absolute white = 100.",
+            VIEW_MODE_PERSISTENCE: "DERIVED • latest real event per polarity/pixel, linear decay to zero over the persistence duration, ending at the interval's exclusive end.",
+            VIEW_MODE_GLOW: "STYLIZED • polarity presence plus a 5×5 spatial halo. Halo pixels are styling, not additional events.",
+            VIEW_MODE_TRAIL: "DERIVED • legacy time-colored accumulation in this interval; logarithmic scaling and relative normalization. No fading decay.",
+            VIEW_MODE_MOTION_ARROWS: "DERIVED • legacy grid centroid displacement estimate, not measured optical flow. Two half-windows, minimum-event and displacement thresholds; normalized heatmap backdrop.",
+        }
+        self.view_mode_hint.setText(descriptions[mode] + "\nPolarity filter: " + self.polarity_combo.currentText())
+
+    def _update_probe_table(self, t0, t1) -> None:
+        batch = select(self.events, t0, t1, polarity=self.polarity_combo.currentText())
+        self.roi_table.setRowCount(len(self.rois))
+        for row, item in enumerate(self.rois):
+            stats = compute_roi_stats(batch, self.hw, item.roi, t0, t1 - t0)
+            values = (item.name, str(stats.n_events), f"{stats.pos} / {stats.neg}",
+                      f"{stats.events_per_ms:.4f}", str(stats.active_pixels))
+            for column, value in enumerate(values):
+                self.roi_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _update_slice_stats(self) -> None:
+        row = self.slice_list.currentRow()
+        if self.events is None or not (0 <= row < len(self.slices)):
+            self.slice_stats.setText("Select a slice to inspect its saved interval.")
+            return
+        item = self.slices[row]
+        roi = Roi(**item.roi_snapshot) if item.roi_snapshot else None
+        cache_key = (id(self.events), item.id, item.t0, item.t1, item.polarity,
+                     None if roi is None else (roi.x, roi.y, roi.w, roi.h))
+        cached = getattr(self, "_slice_stats_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            self.slice_stats.setText(cached[1])
+            return
+        batch = select(self.events, item.t0, item.t1, roi, item.polarity)
+        count = len(batch.t)
+        pos = int(np.sum(batch.p > 0))
+        active = len(np.unique(batch.y.astype(np.int64) * self.hw[1] + batch.x))
+        duration = item.t1 - item.t0
+        self.slice_stats.setText(f"Saved selection [{item.t0}, {item.t1}) µs | {duration} µs\n"
+                                 f"Polarity: {item.polarity} | Events: {count:,} | + / −: {pos:,} / {count-pos:,}\n"
+                                 f"{count / max(0.001, duration/1000):.4f} ev/ms | +/− ratio: {polarity_ratio(pos,count-pos):.4f} | Active pixels: {active:,}\n"
+                                 "ROI bounds are saved with the slice; later ROI edits do not change its export.")
+        self._slice_stats_cache = (cache_key, self.slice_stats.text())
+
+    def _edit_slice_bounds(self) -> None:
+        row = self.slice_list.currentRow()
+        if self.events is not None and 0 <= row < len(self.slices):
+            item = self.slices[row]
+            item.t0, item.t1 = self._current_window()
+            item.polarity = self.polarity_combo.currentText()
+            self._rebuild_slice_list()
+            self.slice_list.setCurrentRow(row)
+
+    def _export_dialog(self, title, **selection) -> None:
+        if self.events is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, title, str(self.data_dir / "exports" / "events.csv"), "CSV (*.csv)")
+        if path:
+            if not Path(path).suffix:
+                path += ".csv"
+            events, hw = self.events, self.hw
+            self._run_task(lambda: export_csv(path, events, hw, **selection),
+                           lambda count: self.statusBar().showMessage(f"Exported {count:,} original events and JSON metadata to {path}"),
+                           "Exporting original event data…")
+
+    def _set_sensor_resolution(self) -> None:
+        if self.events is None:
+            return
+        text, ok = QInputDialog.getText(self, "Sensor resolution", "Actual width × height in pixels (for example 640x480):",
+                                       text=f"{self.hw[1]}x{self.hw[0]}")
+        if not ok:
+            return
+        try:
+            width, height = map(int, text.lower().replace("×", "x").split("x"))
+            if width <= int(self.events.x.max()) or height <= int(self.events.y.max()) or width * height > 16_777_216:
+                raise ValueError("Resolution must contain all event coordinates and stay within 16 megapixels.")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid resolution", str(exc))
+            return
+        self.events = replace(self.events, metadata={**self.events.metadata,
+                              "resolution": [width, height], "resolution_origin": "user-specified sensor dimensions"})
+        self.hw = height, width
+        self.analysis_panel.clear_analysis()
+        self._update_stats_global()
+        self._render_from_ui()
+
+    def _export_full(self) -> None:
+        self._export_dialog("Export full recording", extra={"type": "full recording", "filters": "none"})
+
+    def _export_current(self) -> None:
+        t0, t1 = self._current_window()
+        roi = self.rois[self.active_roi_index].roi if self.active_roi_index is not None else None
+        self._export_dialog("Export current selection", t0=t0, t1=t1, roi=roi,
+                            polarity=self.polarity_combo.currentText())
+
+    def _save_session_as(self) -> None:
+        if self.events is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Session", str(self.projects_root / "session.json"), "JSON (*.json)")
+        if path:
+            from .project_utils import save_json
+            try:
+                if not Path(path).suffix:
+                    path += ".json"
+                if Path(path).suffix.lower() != ".json":
+                    raise ValueError("Session filenames must end in .json.")
+                save_json(Path(path), self._build_session_dict())
+                self.statusBar().showMessage(f"Session saved: {path}")
+            except Exception as exc:
+                QMessageBox.critical(self, "Session save failed", str(exc))
+
+    def _load_session_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Session", str(self.projects_root), "JSON (*.json)")
+        if path:
+            try:
+                session = json.loads(Path(path).read_text(encoding="utf-8"))
+                self._restore_session(session)
+            except Exception as exc:
+                QMessageBox.critical(self, "Session load failed", str(exc))
+
     def _update_window_title(self) -> None:
         self.setWindowTitle(f"Event-Based Studio — {self.project_name}")
 
@@ -505,6 +882,11 @@ class MainWindow(QMainWindow):
         self._render_from_ui()
 
     def closeEvent(self, event) -> None:
+        if self._task is not None:
+            self.statusBar().showMessage("Finish the current import/export before closing.")
+            event.ignore()
+            return
+        self.play_timer.stop()
         if self.browser_ref is not None:
             self.browser_ref.refresh_projects()
             self.browser_ref.show()
@@ -516,61 +898,39 @@ class MainWindow(QMainWindow):
     # Data loading / saving
     # =========================================================
     def on_import_dat_clicked(self) -> None:
-        dat_file, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import .dat",
-            str(Path.home()),
-            "Event files (*.dat)",
-        )
-        if not dat_file:
+        path, _ = QFileDialog.getOpenFileName(self, "Import DAT", str(Path.home()), "Event files (*.dat)")
+        if not path:
             return
-
-        out_dir = self.project_root / "data" / "converted"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            self.statusBar().showMessage("Converting .dat → .h5 (WSL/OpenEB)…")
-            QApplication.processEvents()
-            h5_path = convert_dat_to_h5_windows(dat_file, out_dir=out_dir)
-
-            self.statusBar().showMessage("Exporting .h5 → .csv (WSL/OpenEB)…")
-            QApplication.processEvents()
-            csv_path = out_dir / (Path(h5_path).stem + ".csv")
-            csv_path = h5_to_csv_windows(h5_path, out_csv_path=csv_path)
-
-            if not self.current_project_dir:
-                guess_name = Path(dat_file).stem
-                self.current_project_dir = create_project_dir(self.projects_root, guess_name)
-                self.project_name = self.current_project_dir.name
-                self._update_window_title()
-
-            self._load_csv_into_app(
-                csv_path=Path(csv_path),
-                loaded_name=Path(dat_file).stem,
-                reset_annotations=True,
-            )
-
-        except Exception as e:
-            self.statusBar().showMessage("Import failed")
-            QMessageBox.critical(self, "Import failed", str(e))
-            return
-
-        QMessageBox.information(
-            self,
-            "Import complete",
-            f"Converted and saved to:\n{h5_path}\n{csv_path}",
-        )
+        def convert_and_load():
+            out_dir = self.data_dir / "converted" / uuid4().hex[:12]
+            h5 = convert_dat_to_h5_windows(path, out_dir=out_dir)
+            csv_path = h5_to_csv_windows(h5, out_dir / (h5.stem + ".csv"))
+            events = load_events_from_csv(csv_path)
+            from .science import dat_resolution, fingerprint
+            dimensions = dat_resolution(path)
+            events.metadata.update({"original_path": path, "original_sha256": fingerprint(Path(path)),
+                                    "conversion": "OpenEB DAT → H5 → CSV"})
+            if "width" in dimensions and "height" in dimensions:
+                width, height = dimensions["width"], dimensions["height"]
+                if width <= int(events.x.max()) or height <= int(events.y.max()) or width * height > 16_777_216:
+                    raise ValueError("DAT sensor metadata conflicts with converted event coordinates.")
+                events.metadata.update({"resolution": [width, height], "resolution_origin": "DAT header"})
+            return csv_path, events
+        self._run_task(convert_and_load,
+                       lambda result: self._load_csv_into_app(result[0], Path(path).stem, prepared_events=result[1]),
+                       "Converting DAT → H5 → CSV and loading full recording…")
 
     def _load_csv_into_app(
         self,
         csv_path: Path,
         loaded_name: str,
         reset_annotations: bool = True,
+        prepared_events=None,
     ) -> None:
         self.statusBar().showMessage("Loading events from CSV…")
         QApplication.processEvents()
 
-        events = load_events_from_csv(csv_path, max_events=2_000_000)
+        events = prepared_events if prepared_events is not None else load_events_from_csv(csv_path)
         hw = infer_hw(events)
 
         self.events = events
@@ -579,6 +939,10 @@ class MainWindow(QMainWindow):
         self.t_max = int(events.t.max()) if events.t.size else 0
         self.loaded_name = loaded_name
         self.loaded_csv_path = str(csv_path)
+        self.position_us = self.t_min
+        self.zoom_start, self.zoom_end = self.t_min, self.t_max + 1
+        self.duration_us = min(50_000, self.t_max - self.t_min + 1)
+        self.analysis_panel.clear_analysis()
 
         if events.t.size == 0:
             QMessageBox.warning(self, "Empty", "CSV contains 0 events.")
@@ -607,8 +971,7 @@ class MainWindow(QMainWindow):
             self._rebuild_slice_list()
 
             self.chk_show_rois.setChecked(True)
-            self.window_ms.setValue(50)
-            self.timeline.setValue(0)
+            self._sync_time_widgets()
             self.current_view_mode = VIEW_MODE_RAW
             self.view_mode_combo.setCurrentText(VIEW_MODE_RAW)
 
@@ -617,11 +980,12 @@ class MainWindow(QMainWindow):
         self._update_timeline_slice_regions()
 
         self.statusBar().showMessage(
-            f"Loaded {len(events.t):,} events | {hw[1]}x{hw[0]} | {Path(csv_path).name}"
+            f"Loaded {len(events.t):,} events | {'Complete recording' if events.metadata.get('complete') else 'LIMITED PREVIEW'} | {hw[1]}x{hw[0]} ({events.metadata.get('resolution_origin')}) | {Path(csv_path).name}"
         )
 
     def _roi_to_dict(self, roi_item: NamedROI) -> dict:
         return {
+            "id": roi_item.id,
             "name": roi_item.name,
             "x": int(roi_item.roi.x),
             "y": int(roi_item.roi.y),
@@ -633,6 +997,11 @@ class MainWindow(QMainWindow):
 
     def _slice_to_dict(self, s: Slice) -> dict:
         return {
+            "id": s.id,
+            "roi_id": s.roi_id,
+            "roi_snapshot": s.roi_snapshot,
+            "polarity": s.polarity,
+            "source_sha256": s.source_sha256,
             "name": s.name,
             "t0": int(s.t0),
             "t1": int(s.t1),
@@ -642,19 +1011,31 @@ class MainWindow(QMainWindow):
 
     def _build_session_dict(self) -> dict:
         return {
-            "format_version": 6,
+            "format_version": 7,
             "project_name": self.project_name,
             "source": {
                 "loaded_name": self.loaded_name,
                 "csv_path": self.loaded_csv_path,
-                "max_events": 2_000_000,
+                "max_events": None,
+                "metadata": self.events.metadata if self.events is not None else {},
             },
             "view": {
                 "timeline_value": int(self.timeline.value()),
-                "window_ms": int(self.window_ms.value()),
+                "window_ms": self.duration_us / 1000,
+                "position_us": self.position_us,
+                "duration_us": self.duration_us,
+                "zoom_start": self.zoom_start,
+                "zoom_end": self.zoom_end,
+                "step_us": self.step_us.value(),
+                "polarity": self.polarity_combo.currentText(),
+                "comparison": self.compare_check.isChecked(),
+                "persistence_ms": self.persistence_ms.value(),
+                "glow_intensity": self.glow_intensity.value(),
+                "heat_scale": self.heat_scale.currentText(),
                 "is_playing": bool(self.is_playing),
                 "show_roi_overlays": bool(self.chk_show_rois.isChecked()),
                 "active_roi_index": self.active_roi_index,
+                "selected_slice_index": self.slice_list.currentRow(),
                 "loop_slice_index": self.loop_slice_index,
                 "view_mode": self.current_view_mode,
                 "arrow_grid": int(self.arrow_grid_spin.value()),
@@ -676,7 +1057,7 @@ class MainWindow(QMainWindow):
                 return [self.current_frame.copy()]
             return []
 
-        window_us = int(self.window_ms.value() * 1000)
+        window_us = self.duration_us
         starts = np.linspace(
             self.t_min,
             max(self.t_min, self.t_max - window_us),
@@ -691,37 +1072,29 @@ class MainWindow(QMainWindow):
         return frames
 
     def save_project(self) -> None:
-        if self.current_project_dir is None:
-            name_guess = self.loaded_name or "Untitled Project"
-            self.current_project_dir = create_project_dir(self.projects_root, name_guess)
-            self.project_name = self.current_project_dir.name
-            self._update_window_title()
-
         if self.events is None or not self.loaded_csv_path:
             QMessageBox.warning(self, "Save Project", "Load a dataset before saving the project.")
             return
-
-        session_data = self._build_session_dict()
+        if self.current_project_dir is None:
+            self.current_project_dir = create_project_dir(self.projects_root, self.loaded_name or "Untitled Project")
+            self.project_name = self.current_project_dir.name
+            self._update_window_title()
+        session = self._build_session_dict()
         thumb = self.current_frame.copy() if self.current_frame is not None else None
-        previews = self._generate_preview_frames(n_frames=10)
-
-        try:
-            save_project_bundle(
-                project_dir=self.current_project_dir,
-                project_name=self.project_name,
-                session_data=session_data,
-                thumbnail_frame=thumb,
-                preview_frames=previews,
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Save Project", f"Failed to save project:\n{e}")
-            return
-
-        self.current_session_path = str(session_json_path(self.current_project_dir))
-        self.statusBar().showMessage(f"Project saved: {self.current_project_dir}")
-
-        if self.browser_ref is not None:
-            self.browser_ref.refresh_projects()
+        events, hw, mode = self.events, self.hw, self.current_view_mode
+        parameters, duration = self._render_parameters(), self.duration_us
+        directory, name = self.current_project_dir, self.project_name
+        starts = np.linspace(self.t_min, max(self.t_min, self.t_max - duration + 1), 10, dtype=np.int64)
+        def save():
+            previews = [rendering.render_frame(events, hw, int(t), duration, mode, parameters) for t in starts]
+            save_project_bundle(directory, name, session, thumb, previews)
+            return directory
+        def complete(result):
+            self.current_session_path = str(session_json_path(result))
+            self.statusBar().showMessage(f"Project saved: {result}")
+            if self.browser_ref is not None:
+                self.browser_ref.refresh_projects()
+        self._run_task(save, complete, "Saving session, thumbnail and previews...")
 
     def rename_current_project(self) -> None:
         if self.current_project_dir is None:
@@ -775,9 +1148,9 @@ class MainWindow(QMainWindow):
                     f"Project opened, but session restore failed:\n{e}"
                 )
 
-    def _restore_session(self, session: dict) -> None:
+    def _restore_session(self, session: dict, prepared_events=None) -> None:
         version = session.get("format_version")
-        if version not in (1, 2, 3, 4, 5, 6):
+        if version not in (1, 2, 3, 4, 5, 6, 7):
             raise ValueError(f"Unsupported session format version: {version}")
 
         self.project_name = session.get("project_name", self.project_name)
@@ -800,12 +1173,50 @@ class MainWindow(QMainWindow):
             )
 
         loaded_name = source.get("loaded_name", "") or csv_path.stem
-        max_events = int(source.get("max_events", 2_000_000))
+        if prepared_events is None:
+            self._run_task(lambda: load_events_from_csv(csv_path),
+                           lambda events: self._restore_session(session, events), "Restoring full session dataset…")
+            return
+        expected_hash = source.get("metadata", {}).get("sha256")
+        if expected_hash and expected_hash != prepared_events.metadata.get("sha256"):
+            raise ValueError("Source CSV content has changed since this session was saved. Open it as a new recording instead.")
+
+        def valid_box(box):
+            return all(isinstance(box.get(key), int) for key in ("x", "y", "w", "h")) and min(box["x"], box["y"]) >= 0 and min(box["w"], box["h"]) > 0
+
+        roi_ids = [item.get("id") for item in rois_data if item.get("id")]
+        slice_ids = [item.get("id") for item in slices_data if item.get("id")]
+        if len(set(roi_ids)) != len(roi_ids) or len(set(slice_ids)) != len(slice_ids):
+            raise ValueError("Session contains duplicate ROI or slice IDs.")
+        for item in rois_data:
+            if not valid_box(item):
+                raise ValueError("Session contains invalid ROI bounds; analysis was not restored.")
+        for item in slices_data:
+            if not isinstance(item.get("t0"), int) or not isinstance(item.get("t1"), int) or item["t1"] <= item["t0"]:
+                raise ValueError("Session contains an invalid slice interval.")
+            if item.get("polarity", "both") not in ("both", "pos", "neg"):
+                raise ValueError("Session contains an unknown slice polarity filter.")
+            if item.get("roi_snapshot") and not valid_box(item["roi_snapshot"]):
+                raise ValueError("Session contains invalid saved slice ROI bounds.")
+            if item.get("roi_index") is not None and not item.get("roi_snapshot") and not (0 <= int(item["roi_index"]) < len(rois_data)):
+                raise ValueError("A slice references a missing ROI without saved spatial bounds.")
+            if item.get("source_sha256") and item["source_sha256"] != prepared_events.metadata.get("sha256"):
+                raise ValueError("A slice belongs to a different source recording.")
+        if view.get("polarity", "both") not in ("both", "pos", "neg"):
+            raise ValueError("Session contains an unknown polarity filter.")
 
         self.statusBar().showMessage("Loading session dataset…")
         QApplication.processEvents()
 
-        events = load_events_from_csv(csv_path, max_events=max_events)
+        events = prepared_events
+        saved_metadata = source.get("metadata", {})
+        if saved_metadata.get("resolution"):
+            width, height = map(int, saved_metadata["resolution"])
+            if width <= int(events.x.max()) or height <= int(events.y.max()) or width * height > 16_777_216:
+                raise ValueError("Saved sensor resolution conflicts with event coordinates.")
+            events = replace(events, metadata={**events.metadata, **saved_metadata,
+                             "complete": True, "loaded_events": len(events.t), "load_limit": None})
+        self._restoring = True
         hw = infer_hw(events)
 
         self.events = events
@@ -814,6 +1225,19 @@ class MainWindow(QMainWindow):
         self.t_max = int(events.t.max()) if events.t.size else 0
         self.loaded_name = loaded_name
         self.loaded_csv_path = str(csv_path)
+        # Older versions skipped the first numeric row of headerless CSVs and
+        # navigated only their capped prefix. Preserve that historical time.
+        skip = 0 if events.metadata.get("header_present", True) else min(1, len(events.t) - 1)
+        legacy_limit = int(source.get("max_events") or 2_000_000)
+        legacy_min = int(events.t[skip])
+        legacy_max = int(events.t[min(len(events.t) - 1, skip + legacy_limit - 1)])
+        legacy_position = int(legacy_min + int(view.get("timeline_value", 0)) / 1000 * (legacy_max - legacy_min))
+        self.position_us = int(view.get("position_us", legacy_position))
+        self.position_us = max(self.t_min, min(self.t_max, self.position_us))
+        self.duration_us = max(1, int(view.get("duration_us", float(view.get("window_ms", 50)) * 1000)))
+        self.zoom_start = max(self.t_min, min(self.t_max, int(view.get("zoom_start", self.t_min))))
+        self.zoom_end = max(self.zoom_start + 1, min(self.t_max + 1, int(view.get("zoom_end", self.t_max + 1))))
+        self.analysis_panel.clear_analysis()
 
         self.timeline.setEnabled(True)
         self.window_ms.setEnabled(True)
@@ -835,6 +1259,7 @@ class MainWindow(QMainWindow):
                 )
                 self.rois.append(
                     NamedROI(
+                        id=str(item.get("id") or uuid4().hex),
                         name=str(item.get("name", f"ROI {len(self.rois) + 1}")),
                         roi=roi,
                         visible=bool(item.get("visible", True)),
@@ -849,11 +1274,18 @@ class MainWindow(QMainWindow):
             try:
                 roi_index_raw = item.get("roi_index", None)
                 roi_index = None if roi_index_raw is None else int(roi_index_raw)
+                if item.get("roi_id"):
+                    roi_index = next((index for index, roi in enumerate(self.rois) if roi.id == item["roi_id"]), None)
                 if roi_index is not None and not (0 <= roi_index < len(self.rois)):
                     roi_index = None
 
                 self.slices.append(
                     Slice(
+                        id=str(item.get("id") or uuid4().hex),
+                        roi_id=item.get("roi_id") or (self.rois[roi_index].id if roi_index is not None else None),
+                        roi_snapshot=item.get("roi_snapshot") or (vars(self.rois[roi_index].roi).copy() if roi_index is not None else None),
+                        polarity=item.get("polarity", "both"),
+                        source_sha256=item.get("source_sha256") or events.metadata.get("sha256", ""),
                         name=str(item.get("name", f"Slice {len(self.slices) + 1}")),
                         t0=int(item["t0"]),
                         t1=int(item["t1"]),
@@ -890,6 +1322,8 @@ class MainWindow(QMainWindow):
             VIEW_MODE_HEATMAP,
             VIEW_MODE_TRAIL,
             VIEW_MODE_MOTION_ARROWS,
+            VIEW_MODE_PERSISTENCE,
+            VIEW_MODE_GLOW,
         }:
             self.current_view_mode = VIEW_MODE_RAW
 
@@ -916,6 +1350,9 @@ class MainWindow(QMainWindow):
         self._rebuild_roi_list()
         self._push_rois_to_view()
         self._rebuild_slice_list()
+        selected_slice = int(view.get("selected_slice_index", -1))
+        if 0 <= selected_slice < len(self.slices):
+            self.slice_list.setCurrentRow(selected_slice)
         self._update_timeline_slice_regions()
         self._update_loop_button_text()
 
@@ -927,6 +1364,14 @@ class MainWindow(QMainWindow):
         self.timeline.setValue(timeline_value)
         self.timeline.blockSignals(False)
 
+        self.polarity_combo.setCurrentText(view.get("polarity", "both"))
+        self.persistence_ms.setValue(float(view.get("persistence_ms", 100)))
+        self.glow_intensity.setValue(float(view.get("glow_intensity", 0.7)))
+        self.heat_scale.setCurrentText(view.get("heat_scale", "Log relative"))
+        self.step_us.setValue(int(view.get("step_us", 1000)))
+        self.compare_check.setChecked(bool(view.get("comparison", False)))
+        self._restoring = False
+        self._sync_time_widgets()
         self._render_from_ui()
         self._update_stats_global()
         self._update_roi_status_label()
@@ -949,25 +1394,17 @@ class MainWindow(QMainWindow):
         return 100.0 * pos / total
 
     def _current_window(self) -> Tuple[int, int]:
-        if self.events is None:
-            return (0, 0)
-        frac = self.timeline.value() / 1000.0
-        t0 = int(self.t_min + frac * max(0, self.t_max - self.t_min))
-        t1 = t0 + int(self.window_ms.value() * 1000)
-        return t0, t1
+        return self.position_us, self.position_us + self.duration_us
+
 
     def _time_us_to_slider_value(self, t_us: int) -> int:
-        if self.t_max <= self.t_min:
-            return 0
-        frac = (t_us - self.t_min) / max(1, self.t_max - self.t_min)
-        frac = max(0.0, min(1.0, frac))
-        return int(round(frac * 1000))
+        span = max(1, self.zoom_end - self.zoom_start)
+        return max(0, min(1_000_000, ((t_us - self.zoom_start) * 1_000_000) // span))
+
 
     def _slider_value_to_time_us(self, value: int) -> int:
-        if self.t_max <= self.t_min:
-            return self.t_min
-        frac = value / 1000.0
-        return int(round(self.t_min + frac * (self.t_max - self.t_min)))
+        return self.zoom_start + (value * max(1, self.zoom_end - self.zoom_start)) // 1_000_000
+
 
     def _update_timeline_slice_regions(self) -> None:
         if self.events is None or not self.slices:
@@ -1000,257 +1437,28 @@ class MainWindow(QMainWindow):
     def _extract_window_batch(self, t0: int, t1: int):
         if self.events is None:
             return None
-        mask = (self.events.t >= t0) & (self.events.t < t1)
-        if not np.any(mask):
-            return None
-        return replace(
-            self.events,
-            t=self.events.t[mask],
-            x=self.events.x[mask],
-            y=self.events.y[mask],
-            p=self.events.p[mask],
-        )
+        batch = select(self.events, t0, t1, polarity=self.polarity_combo.currentText())
+        return batch if len(batch.t) else None
 
-    def _normalize_to_uint8(self, arr: np.ndarray) -> np.ndarray:
-        arr = arr.astype(np.float32)
-        mx = float(arr.max()) if arr.size else 0.0
-        if mx <= 0.0:
-            return np.zeros(arr.shape, dtype=np.uint8)
-        arr = arr / mx
-        return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
 
-    def _colorize_heatmap(self, norm: np.ndarray) -> np.ndarray:
-        norm = np.clip(norm, 0.0, 1.0)
-        r = np.clip(2.8 * norm - 1.2, 0.0, 1.0)
-        g = np.clip(3.2 * norm - 0.2, 0.0, 1.0)
-        b = np.clip(1.2 - 2.2 * norm, 0.0, 1.0)
-        rgb = np.stack([r, g, b], axis=-1)
-        rgb = np.power(rgb, 0.8)
-        return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-
-    def _time_to_rgb(self, t_norm: np.ndarray) -> np.ndarray:
-        t_norm = np.clip(t_norm, 0.0, 1.0)
-        r = np.clip(2.2 * t_norm - 0.2, 0.0, 1.0)
-        g = np.clip(1.8 - 2.0 * np.abs(t_norm - 0.5), 0.0, 1.0)
-        b = np.clip(1.2 - 2.0 * t_norm, 0.0, 1.0)
-        return np.stack([r, g, b], axis=-1)
-
-    def _blend_rgb(self, base: np.ndarray, overlay: np.ndarray, alpha: float) -> np.ndarray:
-        alpha = float(np.clip(alpha, 0.0, 1.0))
-        out = (1.0 - alpha) * base.astype(np.float32) + alpha * overlay.astype(np.float32)
-        return np.clip(out, 0, 255).astype(np.uint8)
-
-    def _draw_line_rgb(
-        self,
-        rgb: np.ndarray,
-        x0: int,
-        y0: int,
-        x1: int,
-        y1: int,
-        color: tuple[int, int, int],
-        thickness: int = 1,
-    ) -> None:
-        h, w = rgb.shape[:2]
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-
-        while True:
-            for oy in range(-thickness + 1, thickness):
-                for ox in range(-thickness + 1, thickness):
-                    xx = x0 + ox
-                    yy = y0 + oy
-                    if 0 <= xx < w and 0 <= yy < h:
-                        rgb[yy, xx] = color
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
-
-    def _draw_arrow_rgb(
-        self,
-        rgb: np.ndarray,
-        x0: int,
-        y0: int,
-        x1: int,
-        y1: int,
-        color: tuple[int, int, int],
-        thickness: int = 1,
-    ) -> None:
-        self._draw_line_rgb(rgb, x0, y0, x1, y1, color, thickness=thickness)
-
-        dx = x1 - x0
-        dy = y1 - y0
-        length = max(1.0, float(np.hypot(dx, dy)))
-
-        ux = dx / length
-        uy = dy / length
-
-        head_len = max(4.0, min(10.0, 0.30 * length))
-        left_x = int(round(x1 - head_len * (ux + uy * 0.6)))
-        left_y = int(round(y1 - head_len * (uy - ux * 0.6)))
-        right_x = int(round(x1 - head_len * (ux - uy * 0.6)))
-        right_y = int(round(y1 - head_len * (uy + ux * 0.6)))
-
-        self._draw_line_rgb(rgb, x1, y1, left_x, left_y, color, thickness=thickness)
-        self._draw_line_rgb(rgb, x1, y1, right_x, right_y, color, thickness=thickness)
-
-    def _render_raw_frame(self, t0: int, window_us: int) -> np.ndarray:
-        assert self.events is not None
-        assert self.hw is not None
-        return accumulate_frame(self.events, self.hw, window_us=window_us, t_start_us=t0)
-
-    def _render_heatmap_frame(self, t0: int, t1: int) -> np.ndarray:
-        assert self.hw is not None
-        batch = self._extract_window_batch(t0, t1)
-        h, w = self.hw
-
-        heat = np.zeros((h, w), dtype=np.uint32)
-        if batch is not None and batch.t.size > 0:
-            np.add.at(heat, (batch.y, batch.x), 1)
-
-        if heat.max() > 0:
-            heat_f = np.log1p(heat.astype(np.float32))
-            heat_f /= float(heat_f.max())
-        else:
-            heat_f = heat.astype(np.float32)
-
-        return self._colorize_heatmap(heat_f)
-
-    def _render_trail_frame(self, t0: int, t1: int) -> np.ndarray:
-        assert self.hw is not None
-        batch = self._extract_window_batch(t0, t1)
-        h, w = self.hw
-
-        canvas = np.zeros((h, w, 3), dtype=np.float32)
-        if batch is not None and batch.t.size > 0:
-            ts = batch.t.astype(np.float32)
-            if ts.size > 1 and float(ts.max()) > float(ts.min()):
-                t_norm = (ts - float(ts.min())) / (float(ts.max()) - float(ts.min()))
-            else:
-                t_norm = np.zeros_like(ts, dtype=np.float32)
-
-            colors = self._time_to_rgb(t_norm)
-            np.add.at(canvas[..., 0], (batch.y, batch.x), colors[:, 0])
-            np.add.at(canvas[..., 1], (batch.y, batch.x), colors[:, 1])
-            np.add.at(canvas[..., 2], (batch.y, batch.x), colors[:, 2])
-
-            canvas = np.log1p(canvas)
-            mx = float(canvas.max())
-            if mx > 0:
-                canvas /= mx
-
-        return np.clip(canvas * 255.0, 0, 255).astype(np.uint8)
-
-    def _render_motion_arrows_frame(self, t0: int, t1: int) -> np.ndarray:
-        assert self.hw is not None
-        h, w = self.hw
-
-        # background
-        bg = np.zeros((h, w, 3), dtype=np.uint8)
-        bg[..., 0] = 24
-        bg[..., 1] = 34
-        bg[..., 2] = 58
-
-        # base silhouette from current window heatmap
-        heat_rgb = self._render_heatmap_frame(t0, t1)
-        silhouette_alpha = float(self.arrow_silhouette_spin.value())
-        canvas = self._blend_rgb(bg, heat_rgb, silhouette_alpha)
-
-        total_dt = max(1, t1 - t0)
-        t_a0 = t0
-        t_a1 = t0 + total_dt // 2
-        t_b0 = t_a1
-        t_b1 = t1
-
-        batch_a = self._extract_window_batch(t_a0, t_a1)
-        batch_b = self._extract_window_batch(t_b0, t_b1)
-
-        if batch_a is None or batch_b is None or batch_a.t.size == 0 or batch_b.t.size == 0:
-            return canvas
-
-        cell = int(self.arrow_grid_spin.value())
-        min_events_per_half = int(self.arrow_min_events_spin.value())
-        arrow_scale = float(self.arrow_scale_spin.value())
-
-        for gy in range(0, h, cell):
-            for gx in range(0, w, cell):
-                a_mask = (
-                    (batch_a.x >= gx) & (batch_a.x < gx + cell) &
-                    (batch_a.y >= gy) & (batch_a.y < gy + cell)
-                )
-                b_mask = (
-                    (batch_b.x >= gx) & (batch_b.x < gx + cell) &
-                    (batch_b.y >= gy) & (batch_b.y < gy + cell)
-                )
-
-                a_count = int(np.sum(a_mask))
-                b_count = int(np.sum(b_mask))
-                if a_count < min_events_per_half or b_count < min_events_per_half:
-                    continue
-
-                ax = float(np.mean(batch_a.x[a_mask]))
-                ay = float(np.mean(batch_a.y[a_mask]))
-                bx = float(np.mean(batch_b.x[b_mask]))
-                by = float(np.mean(batch_b.y[b_mask]))
-
-                dx = bx - ax
-                dy = by - ay
-                mag = float(np.hypot(dx, dy))
-
-                # threshold tiny/noisy motion
-                if mag < 1.3:
-                    continue
-
-                # use center between the two centroids as anchor
-                sx = int(round((ax + bx) * 0.5))
-                sy = int(round((ay + by) * 0.5))
-                ex = int(round(sx + dx * arrow_scale))
-                ey = int(round(sy + dy * arrow_scale))
-
-                # stronger color for stronger motion
-                tmag = min(1.0, mag / max(3.0, cell * 0.45))
-                color = self._time_to_rgb(np.array([tmag], dtype=np.float32))[0]
-                color_u8 = tuple(int(v * 255.0) for v in color)
-
-                thickness = 2 if mag >= 3.5 else 1
-                self._draw_arrow_rgb(canvas, sx, sy, ex, ey, color_u8, thickness=thickness)
-
-        return canvas
+    def _render_parameters(self):
+        return {"polarity": self.polarity_combo.currentText(),
+                "heat_scale": self.heat_scale.currentText(),
+                "persistence_us": int(round(self.persistence_ms.value() * 1000)),
+                "glow": self.glow_intensity.value(), "grid": self.arrow_grid_spin.value(),
+                "scale": self.arrow_scale_spin.value(), "minimum": self.arrow_min_events_spin.value(),
+                "silhouette": self.arrow_silhouette_spin.value()}
 
     def _render_mode_frame(self, t0: int, window_us: int) -> np.ndarray:
-        t1 = int(t0 + window_us)
+        return rendering.render_frame(self.events, self.hw, t0, window_us,
+                                      self.current_view_mode, self._render_parameters())
 
-        if self.current_view_mode == VIEW_MODE_RAW:
-            return self._render_raw_frame(t0, window_us)
-
-        if self.current_view_mode == VIEW_MODE_HEATMAP:
-            return self._render_heatmap_frame(t0, t1)
-
-        if self.current_view_mode == VIEW_MODE_TRAIL:
-            return self._render_trail_frame(t0, t1)
-
-        if self.current_view_mode == VIEW_MODE_MOTION_ARROWS:
-            return self._render_motion_arrows_frame(t0, t1)
-
-        return self._render_raw_frame(t0, window_us)
-
-    # =========================================================
-    # Main render
-    # =========================================================
     def _render_from_ui(self) -> None:
-        if self.events is None or self.hw is None:
+        if self.events is None or self.hw is None or self._restoring:
             return
 
         t0, t1 = self._current_window()
-        window_us = int(self.window_ms.value() * 1000)
+        window_us = self.duration_us
         batch = self._extract_window_batch(t0, t1)
 
         if batch is None:
@@ -1269,6 +1477,12 @@ class MainWindow(QMainWindow):
 
         self.current_frame = img.copy()
         self.view.set_frame(img)
+        self._sync_time_widgets()
+        self._update_mode_description()
+        if self.compare_check.isChecked():
+            self.compare_view.set_frame(rendering.raw(self.events, self.hw, t0, t1))
+        self._update_probe_table(t0, t1)
+        self._update_slice_stats()
         self.time_label.setText(f"t = {t0:,} µs   |   {t0 / 1000.0:.2f} ms")
 
         self.statusBar().showMessage(
@@ -1305,7 +1519,7 @@ class MainWindow(QMainWindow):
 
         total = int(self.events.t.size)
         h, w = self.hw
-        dur_us = int(self.t_max - self.t_min) if self.t_max > self.t_min else 0
+        dur_us = int(self.t_max - self.t_min + 1)
         dur_ms = dur_us / 1000.0
         events_per_ms = total / dur_ms if dur_ms > 0 else 0.0
 
@@ -1314,7 +1528,11 @@ class MainWindow(QMainWindow):
                 [
                     "Global",
                     f"Events: {total:,}",
-                    f"Resolution: {w}x{h}",
+                    f"Resolution: {w}x{h} ({self.events.metadata.get('resolution_origin', 'unknown')})",
+                    "Complete recording" if self.events.metadata.get("complete") else "LIMITED PREVIEW — export disabled",
+                    f"+ / −: {int(np.sum(self.events.p > 0)):,} / {int(np.sum(self.events.p <= 0)):,}",
+                    f"Active pixels: {len(np.unique(self.events.y.astype(np.int64) * w + self.events.x)):,}",
+                    f"+/− ratio: {polarity_ratio(int(np.sum(self.events.p > 0)), int(np.sum(self.events.p <= 0))):.4f}",
                     f"Duration: {dur_ms:.2f} ms",
                     f"Events/ms: {events_per_ms:.2f}",
                 ]
@@ -1335,7 +1553,7 @@ class MainWindow(QMainWindow):
         window_us = int(t1 - t0)
 
         stats = compute_roi_stats(
-            events=self.events,
+            events=select(self.events, t0, t1, polarity=self.polarity_combo.currentText()),
             hw=self.hw,
             roi=roi,
             t0_us=int(t0),
@@ -1375,7 +1593,7 @@ class MainWindow(QMainWindow):
 
         roi_item = self.rois[self.active_roi_index]
         t0, _ = self._current_window()
-        window_us = int(self.window_ms.value() * 1000)
+        window_us = self.duration_us
 
         self.analysis_panel.set_analysis_data(
             project_name=self.project_name,
@@ -1394,6 +1612,8 @@ class MainWindow(QMainWindow):
     # =========================================================
     def _on_candidate_roi_changed(self, roi) -> None:
         self._candidate_roi = roi if isinstance(roi, Roi) else None
+        self.view.set_candidate_roi(self._candidate_roi)
+        self.compare_view.set_candidate_roi(self._candidate_roi)
 
         if self._candidate_roi is None:
             self.btn_add_roi.setEnabled(False)
@@ -1411,10 +1631,13 @@ class MainWindow(QMainWindow):
             return
 
         self.rois[self.active_roi_index].roi = roi
+        self._push_rois_to_view()
         self._update_roi_status_label()
 
         t0, t1 = self._current_window()
         self._update_stats_active_roi(t0, t1)
+        self._update_probe_table(t0, t1)
+        self._refresh_analysis_panel()
         self._refresh_analysis_panel()
 
     def _update_roi_status_label(self) -> None:
@@ -1585,96 +1808,21 @@ class MainWindow(QMainWindow):
             json.dump(payload, f, indent=2)
 
     def _export_selected_roi_csv(self) -> None:
-        if self.events is None:
-            QMessageBox.information(self, "Export ROI", "Load a dataset first.")
-            return
-
         row = self.roi_list.currentRow()
-        if row < 0 or row >= len(self.rois):
-            QMessageBox.information(self, "Export ROI", "Select an ROI first.")
-            return
+        if self.events is not None and 0 <= row < len(self.rois):
+            item = self.rois[row]
+            self._export_dialog("Export ROI", roi=item.roi, extra={"roi_id": item.id, "roi_name": item.name})
 
-        roi_item = self.rois[row]
-        roi = roi_item.roi
 
-        rx0, ry0 = roi.x, roi.y
-        rx1, ry1 = roi.x + roi.w, roi.y + roi.h
-
-        mask = (
-            (self.events.x >= rx0) & (self.events.x < rx1) &
-            (self.events.y >= ry0) & (self.events.y < ry1)
-        )
-
-        if not np.any(mask):
-            QMessageBox.information(self, "Export ROI", f'ROI "{roi_item.name}" contains 0 events.')
-            return
-
-        t = self.events.t[mask]
-        x = self.events.x[mask]
-        y = self.events.y[mask]
-        p = self.events.p[mask]
-
-        out_dir = self.project_root / "data" / "roi_exports"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        base = self.loaded_name or "events"
-        safe_roi = self._sanitize_name_for_file(roi_item.name)
-        out_csv = out_dir / f"{base}__ROI__{safe_roi}.csv"
-        out_json = out_dir / f"{base}__ROI__{safe_roi}.json"
-
-        try:
-            with open(out_csv, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["t", "x", "y", "p"])
-                for ti, xi, yi, pi in zip(t.tolist(), x.tolist(), y.tolist(), p.tolist()):
-                    w.writerow([int(ti), int(xi), int(yi), int(pi)])
-
-            sidecar = {
-                "export_type": "roi",
-                "exported_at": now_iso(),
-                "project_name": self.project_name,
-                "source_loaded_name": self.loaded_name,
-                "source_csv_path": self.loaded_csv_path,
-                "source_event_count": int(self.events.t.size),
-                "roi": {
-                    "name": roi_item.name,
-                    "x": int(roi.x),
-                    "y": int(roi.y),
-                    "w": int(roi.w),
-                    "h": int(roi.h),
-                    "visible": bool(roi_item.visible),
-                    "color": roi_item.color,
-                },
-                "exported_event_count": int(len(t)),
-                "time_range_us": {
-                    "t_min": int(t.min()) if len(t) else None,
-                    "t_max": int(t.max()) if len(t) else None,
-                },
-                "files": {
-                    "csv": str(out_csv),
-                    "metadata_json": str(out_json),
-                },
-            }
-            self._write_json_sidecar(out_json, sidecar)
-
-        except Exception as e:
-            QMessageBox.critical(self, "Export ROI failed", str(e))
-            return
-
-        QMessageBox.information(
-            self,
-            "Export ROI",
-            f'Saved ROI "{roi_item.name}" with {len(t):,} events:\n{out_csv}\n\nMetadata:\n{out_json}'
-        )
-
-    # =========================================================
-    # ROI selection / overlay control
-    # =========================================================
     def _delete_selected_roi(self) -> None:
         row = self.roi_list.currentRow()
         if row < 0 or row >= len(self.rois):
             return
 
+        for item in self.slices:
+            if item.roi_index == row and item.roi_snapshot is None:
+                item.roi_snapshot = vars(self.rois[row].roi).copy()
+                item.roi_id = self.rois[row].id
         del self.rois[row]
 
         if self.active_roi_index is not None:
@@ -1702,6 +1850,10 @@ class MainWindow(QMainWindow):
         self._refresh_analysis_panel()
 
     def _clear_all_rois(self) -> None:
+        for item in self.slices:
+            if item.roi_snapshot is None and item.roi_index is not None and item.roi_index < len(self.rois):
+                item.roi_snapshot = vars(self.rois[item.roi_index].roi).copy()
+                item.roi_id = self.rois[item.roi_index].id
         self.rois = []
         self.active_roi_index = None
 
@@ -1748,6 +1900,7 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_roi_overlays(self) -> None:
         self.view.set_show_overlays(self.chk_show_rois.isChecked())
+        self.compare_view.set_show_overlays(self.chk_show_rois.isChecked())
 
     # =========================================================
     # Slice / loop logic
@@ -1782,6 +1935,7 @@ class MainWindow(QMainWindow):
         self.btn_loop_slice.setEnabled(has)
         self._update_loop_button_text()
         self._update_timeline_slice_regions()
+        self._update_slice_stats()
 
     def _rename_selected_slice(self) -> None:
         row = self.slice_list.currentRow()
@@ -1870,6 +2024,9 @@ class MainWindow(QMainWindow):
                 active_vis_idx = sum(1 for i in range(self.active_roi_index) if self.rois[i].visible)
 
         self.view.set_rois(visible_rois, active_index=active_vis_idx)
+        self.compare_view.set_rois(visible_rois, active_index=active_vis_idx)
+        if self.events is not None:
+            self._update_probe_table(*self._current_window())
 
     def _rebuild_slice_list(self) -> None:
         self.slice_list.blockSignals(True)
@@ -1879,6 +2036,8 @@ class MainWindow(QMainWindow):
             roi_tag = ""
             if s.roi_index is not None and 0 <= s.roi_index < len(self.rois):
                 roi_tag = f' | ROI="{self.rois[s.roi_index].name}"'
+            elif s.roi_snapshot:
+                roi_tag = " | saved ROI bounds"
             elif s.roi_index is not None:
                 roi_tag = " | ROI=(missing)"
 
@@ -1918,6 +2077,10 @@ class MainWindow(QMainWindow):
                 t1=t1,
                 roi_index=roi_index,
                 color=self._next_default_slice_color(),
+                roi_id=self.rois[roi_index].id if roi_index is not None else None,
+                roi_snapshot=vars(self.rois[roi_index].roi).copy() if roi_index is not None else None,
+                polarity=self.polarity_combo.currentText(),
+                source_sha256=self.events.metadata.get("sha256", ""),
             )
         )
         self._rebuild_slice_list()
@@ -1926,28 +2089,22 @@ class MainWindow(QMainWindow):
 
     def _jump_to_selected_slice(self) -> None:
         row = self.slice_list.currentRow()
-        if row < 0 or row >= len(self.slices):
+        if self.events is None or not (0 <= row < len(self.slices)):
             return
-        s = self.slices[row]
-
-        if self.events is None:
-            return
-        span = max(1, self.t_max - self.t_min)
-        frac = (s.t0 - self.t_min) / span
-        frac = max(0.0, min(1.0, frac))
-        self.timeline.setValue(int(frac * 1000))
-
-        dur_ms = max(1, int((s.t1 - s.t0) / 1000))
-        self.window_ms.setValue(min(self.window_ms.maximum(), dur_ms))
-
-        if s.roi_index is not None and 0 <= s.roi_index < len(self.rois):
-            self.active_roi_index = s.roi_index
-            self._rebuild_roi_list()
-            self._push_rois_to_view()
-
-        self._render_from_ui()
+        item = self.slices[row]
+        self.duration_us = item.t1 - item.t0
+        self.polarity_combo.blockSignals(True)
+        self.polarity_combo.setCurrentText(item.polarity)
+        self.polarity_combo.blockSignals(False)
+        if item.roi_id:
+            self.active_roi_index = next((i for i, roi in enumerate(self.rois) if roi.id == item.roi_id), None)
+        else:
+            self.active_roi_index = item.roi_index
+        self._rebuild_roi_list()
+        self._push_rois_to_view()
+        self._seek(item.t0)
         self._update_roi_status_label()
-        self._update_timeline_slice_regions()
+
 
     def _delete_selected_slice(self) -> None:
         row = self.slice_list.currentRow()
@@ -1972,111 +2129,20 @@ class MainWindow(QMainWindow):
         self._update_timeline_slice_regions()
 
     def _export_selected_slice_csv(self) -> None:
-        if self.events is None:
-            return
         row = self.slice_list.currentRow()
-        if row < 0 or row >= len(self.slices):
+        if self.events is None or not (0 <= row < len(self.slices)):
             return
-
-        s = self.slices[row]
-        t0, t1 = s.t0, s.t1
-
-        m = (self.events.t >= t0) & (self.events.t < t1)
-        if not np.any(m):
-            QMessageBox.information(self, "Export slice", "Slice contains 0 events.")
+        item = self.slices[row]
+        if item.source_sha256 and item.source_sha256 != self.events.metadata.get("sha256"):
+            QMessageBox.warning(self, "Source mismatch", "This slice belongs to a different recording.")
             return
+        roi = Roi(**item.roi_snapshot) if item.roi_snapshot else None
+        if roi is None and item.roi_index is not None and item.roi_index < len(self.rois):
+            roi = self.rois[item.roi_index].roi
+        self._export_dialog("Export slice", t0=item.t0, t1=item.t1, roi=roi,
+                            polarity=item.polarity, extra={"slice_id": item.id, "name": item.name})
 
-        x = self.events.x[m]
-        y = self.events.y[m]
-        p = self.events.p[m]
-        t = self.events.t[m]
 
-        roi_name = None
-        roi_box = None
-        roi_name_tag = "full"
-
-        if s.roi_index is not None and 0 <= s.roi_index < len(self.rois):
-            roi_item = self.rois[s.roi_index]
-            roi = roi_item.roi
-            rx0, ry0 = roi.x, roi.y
-            rx1, ry1 = roi.x + roi.w, roi.y + roi.h
-            in_roi = (x >= rx0) & (x < rx1) & (y >= ry0) & (y < ry1)
-
-            if not np.any(in_roi):
-                QMessageBox.information(self, "Export slice", "Slice ROI contains 0 events.")
-                return
-
-            x = x[in_roi]
-            y = y[in_roi]
-            p = p[in_roi]
-            t = t[in_roi]
-            roi_name = roi_item.name
-            roi_name_tag = self._sanitize_name_for_file(roi_item.name)
-            roi_box = {
-                "x": int(roi.x),
-                "y": int(roi.y),
-                "w": int(roi.w),
-                "h": int(roi.h),
-                "color": roi_item.color,
-            }
-
-        out_dir = self.project_root / "data" / "slices"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        base = self.loaded_name or "events"
-        safe_slice = self._sanitize_name_for_file(s.name)
-        out_csv = out_dir / f"{base}__{safe_slice}__{roi_name_tag}.csv"
-        out_json = out_dir / f"{base}__{safe_slice}__{roi_name_tag}.json"
-
-        try:
-            with open(out_csv, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["t", "x", "y", "p"])
-                for ti, xi, yi, pi in zip(t.tolist(), x.tolist(), y.tolist(), p.tolist()):
-                    w.writerow([int(ti), int(xi), int(yi), int(pi)])
-
-            sidecar = {
-                "export_type": "slice",
-                "exported_at": now_iso(),
-                "project_name": self.project_name,
-                "source_loaded_name": self.loaded_name,
-                "source_csv_path": self.loaded_csv_path,
-                "source_event_count": int(self.events.t.size),
-                "slice": {
-                    "name": s.name,
-                    "t0_us": int(s.t0),
-                    "t1_us": int(s.t1),
-                    "duration_us": int(s.t1 - s.t0),
-                    "roi_index": s.roi_index,
-                    "roi_name": roi_name,
-                    "roi_box": roi_box,
-                    "color": s.color,
-                },
-                "exported_event_count": int(len(t)),
-                "time_range_us": {
-                    "t_min": int(t.min()) if len(t) else None,
-                    "t_max": int(t.max()) if len(t) else None,
-                },
-                "files": {
-                    "csv": str(out_csv),
-                    "metadata_json": str(out_json),
-                },
-            }
-            self._write_json_sidecar(out_json, sidecar)
-
-        except Exception as e:
-            QMessageBox.critical(self, "Export slice failed", str(e))
-            return
-
-        QMessageBox.information(
-            self,
-            "Export slice",
-            f"Saved:\n{out_csv}\n\nMetadata:\n{out_json}"
-        )
-
-    # =========================================================
-    # Playback
-    # =========================================================
     def _toggle_play(self) -> None:
         if self.events is None:
             return
@@ -2089,32 +2155,19 @@ class MainWindow(QMainWindow):
             self.play_timer.stop()
 
     def _on_tick(self) -> None:
-        if not self.is_playing:
+        if not self.is_playing or self.events is None:
             return
-
+        target = self.position_us + self.step_us.value()
         if self.loop_slice_index is not None and 0 <= self.loop_slice_index < len(self.slices):
-            s = self.slices[self.loop_slice_index]
-            span = max(1, self.t_max - self.t_min)
-
-            current_t0, _ = self._current_window()
-            next_t0 = current_t0 + int((3 / 1000.0) * span)
-
-            if next_t0 >= s.t1:
-                loop_frac = (s.t0 - self.t_min) / span
-                loop_frac = max(0.0, min(1.0, loop_frac))
-                self.timeline.setValue(int(loop_frac * 1000))
-                return
-
-        v = self.timeline.value() + 3
-        if v >= self.timeline.maximum():
-            self.timeline.setValue(self.timeline.maximum())
+            item = self.slices[self.loop_slice_index]
+            if target >= item.t1 or target < item.t0:
+                target = item.t0
+        elif target > self.t_max:
+            target = self.t_max
             self._toggle_play()
-            return
-        self.timeline.setValue(v)
+        self._seek(target)
 
-    # =========================================================
-    # Reset
-    # =========================================================
+
     def _reset_view(self) -> None:
         self.play_timer.stop()
         self.is_playing = False
@@ -2124,6 +2177,9 @@ class MainWindow(QMainWindow):
         self.timeline.setEnabled(False)
         self.window_ms.setEnabled(False)
 
+        self.position_us = 0
+        self.duration_us = 50_000
+        self.zoom_start, self.zoom_end = 0, 1
         self.events = None
         self.hw = None
         self.t_min = 0
@@ -2131,6 +2187,9 @@ class MainWindow(QMainWindow):
         self.loaded_name = ""
         self.loaded_csv_path = ""
         self.current_frame = None
+        self._slice_stats_cache = None
+        self.roi_table.setRowCount(0)
+        self.compare_view.set_frame(np.zeros((10, 10), dtype=np.uint8))
 
         self._candidate_roi = None
         self.view.clear_roi()
@@ -2179,6 +2238,8 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    from .theme import configure_application
+    configure_application(app)
     _try_show_boot(app)
 
     project_root = Path(__file__).resolve().parents[1]
@@ -2190,9 +2251,11 @@ def main() -> None:
     def open_project(project_dir: str) -> None:
         browser.hide()
         win = MainWindow(browser_ref=browser, project_dir=project_dir)
+        win.setAttribute(Qt.WA_DeleteOnClose, True)
         win.resize(1600, 950)
         win.show()
         windows.append(win)
+        win.destroyed.connect(lambda _=None, window=win: windows.remove(window) if window in windows else None)
 
     browser = ProjectBrowser(projects_root=projects_root, open_project_callback=open_project)
     browser.show()

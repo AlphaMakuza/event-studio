@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import shlex
+from uuid import uuid4
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -10,6 +12,13 @@ WSL_DISTRO: Optional[str] = None
 
 # Where we stage imports inside WSL (Linux path)
 WSL_IMPORT_DIR = "$HOME/__event_studio_imports__"
+
+
+def _shell_path(path: str) -> str:
+    # Expand only our trusted HOME prefix; filenames stay literal shell arguments.
+    if path.startswith("$HOME/"):
+        return '"$HOME"/' + shlex.quote(path[len("$HOME/"):])
+    return shlex.quote(path)
 
 # Candidate OpenEB bin folders (we'll probe these first)
 OPENEB_BIN_CANDIDATES = [
@@ -101,7 +110,7 @@ def _wsl_stage_in_from_windows(win_src: Path, wsl_dst: str) -> None:
     """
     wsl_src = _wslpath(win_src)
     _run_wsl(f'mkdir -p "{WSL_IMPORT_DIR}"')
-    _run_wsl(f'cp -f "{wsl_src}" "{wsl_dst}"')
+    _run_wsl(f'cp -- {_shell_path(wsl_src)} {_shell_path(wsl_dst)}')
 
 
 def _wsl_stage_out_to_windows(wsl_src: str, win_dst: Path) -> None:
@@ -111,7 +120,7 @@ def _wsl_stage_out_to_windows(wsl_src: str, win_dst: Path) -> None:
     """
     win_dst.parent.mkdir(parents=True, exist_ok=True)
     wsl_dst = _wslpath(win_dst)
-    _run_wsl(f'cp -f "{wsl_src}" "{wsl_dst}"')
+    _run_wsl(f'cp -- {_shell_path(wsl_src)} {_shell_path(wsl_dst)}')
 
 
 # -----------------------------
@@ -149,21 +158,25 @@ def convert_dat_to_h5_windows(
             out_h5_path = out_dir / (dat_path.stem + ".h5")
 
     out_h5_path = Path(out_h5_path).expanduser().resolve()
+    if out_h5_path.exists():
+        raise FileExistsError(f"Conversion output already exists: {out_h5_path}")
 
     openeb_bin = _find_openeb_bin()
     tool_hdf5 = f"{openeb_bin}/metavision_file_to_hdf5"
 
-    wsl_dat = f'{WSL_IMPORT_DIR}/{dat_path.name}'
-    wsl_h5 = f'{WSL_IMPORT_DIR}/{out_h5_path.name}'
+    token = uuid4().hex
+    wsl_dat = f'{WSL_IMPORT_DIR}/{token}_{dat_path.name}'
+    wsl_h5 = f'{WSL_IMPORT_DIR}/{token}_{out_h5_path.name}'
 
     # stage in
     _wsl_stage_in_from_windows(dat_path, wsl_dat)
 
     # convert
-    _run_wsl(f'"{tool_hdf5}" -i "{wsl_dat}" -o "{wsl_h5}"')
+    _run_wsl(f'{_shell_path(tool_hdf5)} -i {_shell_path(wsl_dat)} -o {_shell_path(wsl_h5)}')
 
     # stage out
     _wsl_stage_out_to_windows(wsl_h5, out_h5_path)
+    _run_wsl(f'rm -f -- {_shell_path(wsl_dat)} {_shell_path(wsl_h5)}')
 
     return out_h5_path
 
@@ -178,6 +191,8 @@ def h5_to_csv_windows(
     """
     h5_path = Path(h5_path).expanduser().resolve()
     out_csv_path = Path(out_csv_path).expanduser().resolve()
+    if out_csv_path.exists():
+        raise FileExistsError(f"Conversion output already exists: {out_csv_path}")
 
     if not h5_path.exists():
         raise FileNotFoundError(f"H5 does not exist: {h5_path}")
@@ -185,17 +200,19 @@ def h5_to_csv_windows(
     openeb_bin = _find_openeb_bin()
     tool_csv = f"{openeb_bin}/metavision_file_to_csv"
 
-    wsl_h5 = f'{WSL_IMPORT_DIR}/{h5_path.name}'
-    wsl_csv = f'{WSL_IMPORT_DIR}/{out_csv_path.name}'
+    token = uuid4().hex
+    wsl_h5 = f'{WSL_IMPORT_DIR}/{token}_{h5_path.name}'
+    wsl_csv = f'{WSL_IMPORT_DIR}/{token}_{out_csv_path.name}'
 
     # stage in
     _wsl_stage_in_from_windows(h5_path, wsl_h5)
 
     # convert (no -v; yours doesn't support it)
-    _run_wsl(f'"{tool_csv}" -i "{wsl_h5}" -o "{wsl_csv}"')
+    _run_wsl(f'{_shell_path(tool_csv)} -i {_shell_path(wsl_h5)} -o {_shell_path(wsl_csv)}')
 
     # stage out
     _wsl_stage_out_to_windows(wsl_csv, out_csv_path)
+    _run_wsl(f'rm -f -- {_shell_path(wsl_h5)} {_shell_path(wsl_csv)}')
 
     return out_csv_path
 

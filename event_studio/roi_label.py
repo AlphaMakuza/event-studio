@@ -98,6 +98,10 @@ class ROILabel(QWidget):
     def get_roi(self) -> Optional[Roi]:
         return self._candidate_roi
 
+    def set_candidate_roi(self, roi: Optional[Roi]) -> None:
+        self._candidate_roi = roi
+        self.update()
+
     def set_frame(self, img: np.ndarray) -> None:
         """
         Supports:
@@ -197,16 +201,16 @@ class ROILabel(QWidget):
     def _normalize_roi(self, roi: Roi) -> Roi:
         x = max(0, min(self._img_w - 1, roi.x))
         y = max(0, min(self._img_h - 1, roi.y))
-        w = max(2, roi.w)
-        h = max(2, roi.h)
+        w = max(1, roi.w)
+        h = max(1, roi.h)
 
         if x + w > self._img_w:
             w = self._img_w - x
         if y + h > self._img_h:
             h = self._img_h - y
 
-        w = max(2, w)
-        h = max(2, h)
+        w = max(1, w)
+        h = max(1, h)
         return Roi(x=x, y=y, w=w, h=h)
 
     def _unpack_roi_entry(self, entry) -> tuple[Roi, str]:
