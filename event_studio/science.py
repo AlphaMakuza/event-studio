@@ -149,10 +149,13 @@ def select(events, t0=None, t1=None, roi=None, polarity="both"):
     return replace(batch, t=batch.t[mask], x=batch.x[mask], y=batch.y[mask], p=batch.p[mask])
 
 
-def export_csv(path, events, hw, *, t0=None, t1=None, roi=None, polarity="both", extra=None):
+def export_csv(path, events, hw, *, t0=None, t1=None, roi=None, polarity="both", extra=None, filter_spec=None):
     """Export exactly the selected original event tuples, with provenance."""
     if not events.metadata.get("complete", False):
         raise ValueError("This dataset is a limited preview. Reload the full recording before exporting.")
+    if filter_spec:
+        from .filters import apply_filters
+        events = apply_filters(events, filter_spec)
     batch = select(events, t0, t1, roi, polarity)
     path = Path(path)
     if path.suffix.lower() != ".csv":
@@ -160,25 +163,24 @@ def export_csv(path, events, hw, *, t0=None, t1=None, roi=None, polarity="both",
     if path.resolve() == Path(events.metadata.get("csv_path", "")).resolve():
         raise ValueError("Choose a different export path; the source recording must remain unchanged.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".csv.tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+    from .project_utils import save_json
+    from .io_utils import commit_pair
+    from .version import __version__
+    with tempfile.TemporaryDirectory(prefix="export-", dir=path.parent) as folder:
+        staged = Path(folder) / path.name
+        with staged.open("w", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream)
             writer.writerow(("t", "x", "y", "p"))
             writer.writerows(zip(batch.t, batch.x, batch.y, batch.p))
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    from .project_utils import save_json
-    payload = {
-        "format_version": 1, "source": events.metadata,
-        "sensor_resolution": {"width": hw[1], "height": hw[0],
-                              "origin": events.metadata.get("resolution_origin", "unknown")},
-        "selection": {"start_us": t0, "end_us_exclusive": t1, "polarity": polarity,
-                      "roi": None if roi is None else vars(roi)},
-        "exported_event_count": len(batch.t), "timestamp_unit": "us",
-        "csv_sha256": fingerprint(path), "details": extra or {},
-    }
-    save_json(path.with_suffix(".json"), payload)
+        payload = {
+            "format_version": 2, "software_version": __version__, "source": events.metadata,
+            "sensor_resolution": {"width": hw[1], "height": hw[0],
+                                  "origin": events.metadata.get("resolution_origin", "unknown")},
+            "selection": {"start_us": t0, "end_us_exclusive": t1, "polarity": polarity,
+                          "roi": None if roi is None else vars(roi)},
+            "exported_event_count": len(batch.t), "timestamp_unit": "us",
+            "csv_sha256": fingerprint(staged), "details": extra or {},
+        }
+        save_json(staged.with_suffix(".json"), payload)
+        commit_pair(staged, staged.with_suffix(".json"), path, path.with_suffix(".json"))
     return len(batch.t)

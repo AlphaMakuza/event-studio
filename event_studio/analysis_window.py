@@ -681,7 +681,7 @@ class ROIAnalysisPanel(QWidget):
         )
         time_interval_elapsed = (now - self._last_trail_update_walltime) >= self.TRAIL_UPDATE_INTERVAL_SEC
 
-        if cache_invalid or (playhead_changed_enough and time_interval_elapsed):
+        if cache_invalid or self._last_trail_playhead_us != current_t_end_us:
             self._last_trail_rgb = self._build_roi_trail_map(events, roi, current_t_end_us)
             self._last_trail_update_walltime = now
             self._last_trail_playhead_us = current_t_end_us

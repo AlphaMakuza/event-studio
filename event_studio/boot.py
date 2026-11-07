@@ -5,7 +5,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QTimer, QRect, QUrl
 from PySide6.QtGui import QPixmap
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
 
@@ -48,10 +48,10 @@ class BootOverlay(QWidget):
 
         # IMPORTANT: keep the player alive even if the overlay hides
         # (we hide, not close, so this is safe)
-        self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio)
-        self.audio.setVolume(0.9)
+        # The asset is PCM WAV: use Qt's short-sound path rather than an FFmpeg
+        # media pipeline, whose early shutdown stalled in native release tests.
+        self.player = QSoundEffect(self)
+        self.player.setVolume(0.9)
 
         wav_path = _asset_path("boot.wav")
         if wav_path.exists():
@@ -114,7 +114,11 @@ def show_boot(
             # Optional cleanup: delete overlay after audio ends.
             # If duration isn't known/available, just delete later after a buffer.
             # (boot.wav is ~10s in your case)
-            QTimer.singleShot(12_000, overlay.deleteLater)
+            def cleanup_when_finished():
+                if not overlay.player.isPlaying():
+                    overlay.deleteLater()
+            overlay.player.playingChanged.connect(cleanup_when_finished)
+            cleanup_when_finished()
 
         if on_done:
             on_done()

@@ -5,6 +5,7 @@ from PySide6.QtCore import QThread, Signal
 class Task(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
+    progress = Signal(int, str)
 
     def __init__(self, function, parent=None):
         super().__init__(parent)

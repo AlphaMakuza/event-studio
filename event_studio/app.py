@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QProgressDialog,
 )
 from .science import select, export_csv, polarity_ratio
 from . import rendering
@@ -120,6 +121,7 @@ class Slice:
     roi_snapshot: Optional[dict] = None
     polarity: str = "both"
     source_sha256: str = ""
+    filters: dict = field(default_factory=dict)
 
 
 class MainWindow(QMainWindow):
@@ -165,6 +167,12 @@ class MainWindow(QMainWindow):
         self.zoom_end = 1
         self._task = None
         self._restoring = False
+        self.filtered_events = None
+        self.filter_settings = {}
+        self.analysis_settings = {}
+        self.annotations = []
+        self.detections = []
+        self._workspace = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -507,6 +515,7 @@ class MainWindow(QMainWindow):
         self.timeline.valueChanged.connect(self._on_timeline_changed)
         self.timeline.sliceSelected.connect(self._on_timeline_slice_selected)
         self.timeline.sliceEdited.connect(self._on_timeline_slice_edited)
+        self.timeline.markerSelected.connect(self._on_analysis_marker)
         controls.addWidget(self.timeline, stretch=1)
 
         self.time_label = QLabel("t = —")
@@ -587,6 +596,11 @@ class MainWindow(QMainWindow):
         reset_action = QAction("Reset View", self)
         reset_action.triggered.connect(self._reset_view)
         file_menu.addAction(reset_action)
+        analysis_menu = self.menuBar().addMenu("&Analysis")
+        analysis_action = QAction("Advanced Analysis…", self)
+        analysis_action.setShortcut("Ctrl+Shift+A")
+        analysis_action.triggered.connect(self._open_analysis_workspace)
+        analysis_menu.addAction(analysis_action)
 
         self.statusBar().showMessage("Ready")
         self._update_window_title()
@@ -598,7 +612,7 @@ class MainWindow(QMainWindow):
     # =========================================================
     # General helpers
     # =========================================================
-    def _run_task(self, function, finished, message="Working…") -> None:
+    def _run_task(self, function, finished, message="Working…", cooperative=False) -> None:
         if self._task is not None:
             return
         if self.is_playing:
@@ -606,7 +620,17 @@ class MainWindow(QMainWindow):
         self.centralWidget().setEnabled(False)
         self.menuBar().setEnabled(False)
         self.statusBar().showMessage(message)
-        task = Task(function, self)
+        dialog = QProgressDialog(message, "Cancel" if cooperative else "", 0, 100 if cooperative else 0, self)
+        dialog.setWindowTitle("Event-Based Studio")
+        dialog.setAutoClose(False)
+        dialog.setMinimumDuration(300)
+        if not cooperative:
+            dialog.setCancelButton(None)
+        task = Task(lambda: function(task.isInterruptionRequested, task.progress.emit) if cooperative else function(), self)
+        dialog.canceled.connect(task.requestInterruption)
+        task.progress.connect(lambda value, text: (dialog.setValue(min(99,value)), dialog.setLabelText(text)))
+        if self._workspace is not None:
+            self._workspace.setEnabled(False)
         self._task = task
 
         def success(result):
@@ -620,12 +644,50 @@ class MainWindow(QMainWindow):
             self.centralWidget().setEnabled(True)
             self.menuBar().setEnabled(True)
             self._task = None
+            dialog.close()
+            dialog.deleteLater()
+            if self._workspace is not None:
+                self._workspace.setEnabled(True)
             task.deleteLater()
 
         task.succeeded.connect(success)
         task.failed.connect(lambda error: QMessageBox.critical(self, "Operation failed", error))
         task.finished.connect(cleanup)
         task.start()
+
+    def _display_events(self):
+        return self.filtered_events if self.filtered_events is not None else self.events
+
+    def _open_analysis_workspace(self):
+        if self.events is None:
+            QMessageBox.information(self, "Advanced analysis", "Load a recording first.")
+            return
+        from .analysis_workspace import AnalysisWorkspace
+        if self._workspace is None:
+            self._workspace = AnalysisWorkspace(self)
+        self._workspace.use_current_interval()
+        self._workspace.show()
+        self._workspace.raise_()
+
+    def _apply_filter_settings(self, settings, after=None):
+        from .filters import apply_filters
+        source = self.events
+        def completed(filtered):
+            self.filter_settings = dict(settings)
+            self.filtered_events = filtered if any(settings.values()) else None
+            self._slice_stats_cache = None
+            self._render_from_ui()
+            if after is not None:
+                after()
+        self._run_task(lambda cancel, progress: apply_filters(source,settings,cancel,progress),completed,
+                       "Applying explicit filters…",cooperative=True)
+
+    def _on_analysis_marker(self, index):
+        markers = self.detections + self.annotations
+        if 0 <= index < len(markers):
+            item = markers[index]
+            self.duration_us = max(1,item['t1']-item['t0'])
+            self._seek(item['t0'])
 
     def _open_recording(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open recording", str(self.data_dir),
@@ -717,7 +779,7 @@ class MainWindow(QMainWindow):
         for widget in self.arrow_widgets:
             widget.setVisible(mode == VIEW_MODE_MOTION_ARROWS)
         if mode == VIEW_MODE_HEATMAP:
-            batch = select(self.events, *self._current_window(), polarity=self.polarity_combo.currentText())
+            batch = select(self._display_events(), *self._current_window(), polarity=self.polarity_combo.currentText())
             packed = batch.y.astype(np.int64) * self.hw[1] + batch.x
             self._heat_peak = int(np.bincount(packed).max()) if len(packed) else 0
         descriptions = {
@@ -728,10 +790,13 @@ class MainWindow(QMainWindow):
             VIEW_MODE_TRAIL: "DERIVED • legacy time-colored accumulation in this interval; logarithmic scaling and relative normalization. No fading decay.",
             VIEW_MODE_MOTION_ARROWS: "DERIVED • legacy grid centroid displacement estimate, not measured optical flow. Two half-windows, minimum-event and displacement thresholds; normalized heatmap backdrop.",
         }
-        self.view_mode_hint.setText(descriptions[mode] + "\nPolarity filter: " + self.polarity_combo.currentText())
+        prefix = "DERIVED filtered view: " + str(self.filter_settings) + "\n" if self.filtered_events is not None else ""
+        if self.filtered_events is not None:
+            self.view_box.setTitle("DERIVED filtered | " + mode)
+        self.view_mode_hint.setText(prefix + descriptions[mode] + "\nPolarity filter: " + self.polarity_combo.currentText())
 
     def _update_probe_table(self, t0, t1) -> None:
-        batch = select(self.events, t0, t1, polarity=self.polarity_combo.currentText())
+        batch = select(self._display_events(), t0, t1, polarity=self.polarity_combo.currentText())
         self.roi_table.setRowCount(len(self.rois))
         for row, item in enumerate(self.rois):
             stats = compute_roi_stats(batch, self.hw, item.roi, t0, t1 - t0)
@@ -747,13 +812,15 @@ class MainWindow(QMainWindow):
             return
         item = self.slices[row]
         roi = Roi(**item.roi_snapshot) if item.roi_snapshot else None
-        cache_key = (id(self.events), item.id, item.t0, item.t1, item.polarity,
+        cache_key = (id(self.events), item.id, item.t0, item.t1, item.polarity,tuple(sorted(item.filters.items())),
                      None if roi is None else (roi.x, roi.y, roi.w, roi.h))
         cached = getattr(self, "_slice_stats_cache", None)
         if cached is not None and cached[0] == cache_key:
             self.slice_stats.setText(cached[1])
             return
-        batch = select(self.events, item.t0, item.t1, roi, item.polarity)
+        from .filters import apply_filters
+        source = self._display_events() if item.filters == self.filter_settings else apply_filters(self.events,item.filters)
+        batch = select(source, item.t0, item.t1, roi, item.polarity)
         count = len(batch.t)
         pos = int(np.sum(batch.p > 0))
         active = len(np.unique(batch.y.astype(np.int64) * self.hw[1] + batch.x))
@@ -770,6 +837,7 @@ class MainWindow(QMainWindow):
             item = self.slices[row]
             item.t0, item.t1 = self._current_window()
             item.polarity = self.polarity_combo.currentText()
+            item.filters = self.filter_settings.copy()
             self._rebuild_slice_list()
             self.slice_list.setCurrentRow(row)
 
@@ -813,7 +881,7 @@ class MainWindow(QMainWindow):
         t0, t1 = self._current_window()
         roi = self.rois[self.active_roi_index].roi if self.active_roi_index is not None else None
         self._export_dialog("Export current selection", t0=t0, t1=t1, roi=roi,
-                            polarity=self.polarity_combo.currentText())
+                            polarity=self.polarity_combo.currentText(),filter_spec=self.filter_settings)
 
     def _save_session_as(self) -> None:
         if self.events is None:
@@ -959,6 +1027,12 @@ class MainWindow(QMainWindow):
         self.play_btn.setText("Play")
 
         if reset_annotations:
+            self.filtered_events = None
+            self.filter_settings = {}
+            self.annotations = []
+            self.detections = []
+            if self._workspace is not None:
+                self._workspace.clear_results()
             self._candidate_roi = None
             self.view.clear_roi()
             self.rois = []
@@ -998,6 +1072,7 @@ class MainWindow(QMainWindow):
     def _slice_to_dict(self, s: Slice) -> dict:
         return {
             "id": s.id,
+            "filters": s.filters,
             "roi_id": s.roi_id,
             "roi_snapshot": s.roi_snapshot,
             "polarity": s.polarity,
@@ -1011,8 +1086,12 @@ class MainWindow(QMainWindow):
 
     def _build_session_dict(self) -> dict:
         return {
-            "format_version": 7,
+            "format_version": 8,
             "project_name": self.project_name,
+            "filters": self.filter_settings,
+            "analysis_settings": self.analysis_settings,
+            "annotations": self.annotations,
+            "detections": self.detections,
             "source": {
                 "loaded_name": self.loaded_name,
                 "csv_path": self.loaded_csv_path,
@@ -1081,7 +1160,7 @@ class MainWindow(QMainWindow):
             self._update_window_title()
         session = self._build_session_dict()
         thumb = self.current_frame.copy() if self.current_frame is not None else None
-        events, hw, mode = self.events, self.hw, self.current_view_mode
+        events, hw, mode = self._display_events(), self.hw, self.current_view_mode
         parameters, duration = self._render_parameters(), self.duration_us
         directory, name = self.current_project_dir, self.project_name
         starts = np.linspace(self.t_min, max(self.t_min, self.t_max - duration + 1), 10, dtype=np.int64)
@@ -1149,12 +1228,41 @@ class MainWindow(QMainWindow):
                 )
 
     def _restore_session(self, session: dict, prepared_events=None) -> None:
-        version = session.get("format_version")
-        if version not in (1, 2, 3, 4, 5, 6, 7):
-            raise ValueError(f"Unsupported session format version: {version}")
+        from .session_validation import validate_settings
+        from .filters import apply_filters
+        validate_settings(session)
+        settings = session.get("filters", {})
+        if prepared_events is None:
+            source = Path(session.get("source", {}).get("csv_path", ""))
+            def prepare(cancel, progress):
+                raw = load_events_from_csv(source)
+                return raw, apply_filters(raw,settings,cancel,progress)
+            self._run_task(prepare,lambda result:self._restore_session(session,result),
+                           "Restoring analysis dataset and filters...",cooperative=True)
+            return
+        raw, filtered = prepared_events if isinstance(prepared_events,tuple) else (prepared_events,apply_filters(prepared_events,settings))
+        previous = self._build_session_dict() if self.events is not None else None
+        previous_events, previous_name = self.events, self.project_name
+        previous_filtered, previous_settings = self.filtered_events, self.filter_settings
+        self.filtered_events = filtered if any(settings.values()) else None
+        self.filter_settings = dict(settings)
+        try:
+            self._apply_session(session, raw)
+        except Exception:
+            self._restoring = False
+            self.filtered_events, self.filter_settings = previous_filtered, previous_settings
+            if previous is not None:
+                self._apply_session(previous, previous_events)
+            else:
+                self._reset_view()
+            self.project_name = previous_name
+            self._update_window_title()
+            raise
 
-        self.project_name = session.get("project_name", self.project_name)
-        self._update_window_title()
+    def _apply_session(self, session: dict, prepared_events=None) -> None:
+        version = session.get("format_version")
+        if version not in (1, 2, 3, 4, 5, 6, 7, 8):
+            raise ValueError(f"Unsupported session format version: {version}")
 
         source = session.get("source", {})
         view = session.get("view", {})
@@ -1217,6 +1325,8 @@ class MainWindow(QMainWindow):
             events = replace(events, metadata={**events.metadata, **saved_metadata,
                              "complete": True, "loaded_events": len(events.t), "load_limit": None})
         self._restoring = True
+        self.project_name = session.get("project_name", self.project_name)
+        self._update_window_title()
         hw = infer_hw(events)
 
         self.events = events
@@ -1286,6 +1396,7 @@ class MainWindow(QMainWindow):
                         roi_snapshot=item.get("roi_snapshot") or (vars(self.rois[roi_index].roi).copy() if roi_index is not None else None),
                         polarity=item.get("polarity", "both"),
                         source_sha256=item.get("source_sha256") or events.metadata.get("sha256", ""),
+                        filters=item.get("filters", {}),
                         name=str(item.get("name", f"Slice {len(self.slices) + 1}")),
                         t0=int(item["t0"]),
                         t1=int(item["t1"]),
@@ -1342,6 +1453,7 @@ class MainWindow(QMainWindow):
         self.chk_show_rois.setChecked(show_rois)
         self.chk_show_rois.blockSignals(False)
         self.view.set_show_overlays(show_rois)
+        self.compare_view.set_show_overlays(show_rois)
 
         self.view_mode_combo.blockSignals(True)
         self.view_mode_combo.setCurrentText(self.current_view_mode)
@@ -1370,6 +1482,11 @@ class MainWindow(QMainWindow):
         self.heat_scale.setCurrentText(view.get("heat_scale", "Log relative"))
         self.step_us.setValue(int(view.get("step_us", 1000)))
         self.compare_check.setChecked(bool(view.get("comparison", False)))
+        self.analysis_settings = session.get("analysis_settings", {})
+        self.annotations = session.get("annotations", [])
+        self.detections = session.get("detections", [])
+        if self._workspace is not None:
+            self._workspace.clear_results()
         self._restoring = False
         self._sync_time_widgets()
         self._render_from_ui()
@@ -1407,6 +1524,12 @@ class MainWindow(QMainWindow):
 
 
     def _update_timeline_slice_regions(self) -> None:
+        markers = self.detections + self.annotations if self.events is not None else []
+        self.timeline.set_analysis_markers([
+            {"index":i,"start_value":self._time_us_to_slider_value(item['t0']),
+             "end_value":self._time_us_to_slider_value(item['t1']),
+             "color":"#ff9500" if i < len(self.detections) else "#64d2ff"}
+            for i,item in enumerate(markers) if item['t1'] >= self.zoom_start and item['t0'] <= self.zoom_end])
         if self.events is None or not self.slices:
             self.timeline.clear_slice_regions()
             return
@@ -1437,7 +1560,7 @@ class MainWindow(QMainWindow):
     def _extract_window_batch(self, t0: int, t1: int):
         if self.events is None:
             return None
-        batch = select(self.events, t0, t1, polarity=self.polarity_combo.currentText())
+        batch = select(self._display_events(), t0, t1, polarity=self.polarity_combo.currentText())
         return batch if len(batch.t) else None
 
 
@@ -1450,7 +1573,7 @@ class MainWindow(QMainWindow):
                 "silhouette": self.arrow_silhouette_spin.value()}
 
     def _render_mode_frame(self, t0: int, window_us: int) -> np.ndarray:
-        return rendering.render_frame(self.events, self.hw, t0, window_us,
+        return rendering.render_frame(self._display_events(), self.hw, t0, window_us,
                                       self.current_view_mode, self._render_parameters())
 
     def _render_from_ui(self) -> None:
@@ -1553,7 +1676,7 @@ class MainWindow(QMainWindow):
         window_us = int(t1 - t0)
 
         stats = compute_roi_stats(
-            events=select(self.events, t0, t1, polarity=self.polarity_combo.currentText()),
+            events=select(self._display_events(), t0, t1, polarity=self.polarity_combo.currentText()),
             hw=self.hw,
             roi=roi,
             t0_us=int(t0),
@@ -2081,6 +2204,7 @@ class MainWindow(QMainWindow):
                 roi_snapshot=vars(self.rois[roi_index].roi).copy() if roi_index is not None else None,
                 polarity=self.polarity_combo.currentText(),
                 source_sha256=self.events.metadata.get("sha256", ""),
+                filters=self.filter_settings.copy(),
             )
         )
         self._rebuild_slice_list()
@@ -2092,6 +2216,9 @@ class MainWindow(QMainWindow):
         if self.events is None or not (0 <= row < len(self.slices)):
             return
         item = self.slices[row]
+        if item.filters != self.filter_settings:
+            self._apply_filter_settings(item.filters,self._jump_to_selected_slice)
+            return
         self.duration_us = item.t1 - item.t0
         self.polarity_combo.blockSignals(True)
         self.polarity_combo.setCurrentText(item.polarity)
@@ -2140,7 +2267,7 @@ class MainWindow(QMainWindow):
         if roi is None and item.roi_index is not None and item.roi_index < len(self.rois):
             roi = self.rois[item.roi_index].roi
         self._export_dialog("Export slice", t0=item.t0, t1=item.t1, roi=roi,
-                            polarity=item.polarity, extra={"slice_id": item.id, "name": item.name})
+                            polarity=item.polarity, filter_spec=item.filters, extra={"slice_id": item.id, "name": item.name})
 
 
     def _toggle_play(self) -> None:
@@ -2180,6 +2307,11 @@ class MainWindow(QMainWindow):
         self.position_us = 0
         self.duration_us = 50_000
         self.zoom_start, self.zoom_end = 0, 1
+        self.filtered_events = None
+        self.filter_settings = {}
+        self.annotations = []
+        self.detections = []
+        self.timeline.set_analysis_markers([])
         self.events = None
         self.hw = None
         self.t_min = 0
@@ -2207,6 +2339,7 @@ class MainWindow(QMainWindow):
         self.chk_show_rois.setChecked(True)
         self.chk_show_rois.blockSignals(False)
         self.view.set_show_overlays(True)
+        self.compare_view.set_show_overlays(True)
 
         self.current_view_mode = VIEW_MODE_RAW
         self.view_mode_combo.blockSignals(True)

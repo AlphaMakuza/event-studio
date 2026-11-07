@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QSlider
 class TimelineSlider(QSlider):
     sliceSelected = Signal(int)
     sliceEdited = Signal(int, int, int)  # index, start_value, end_value
+    markerSelected = Signal(int)
 
     def __init__(self, orientation=Qt.Horizontal, parent=None) -> None:
         super().__init__(orientation, parent)
@@ -23,6 +24,12 @@ class TimelineSlider(QSlider):
         self._drag_start_value: int = 0
         self._drag_end_value: int = 0
         self._handle_px = 8
+        self._analysis_markers = []
+        self.setMinimumHeight(40)
+
+    def set_analysis_markers(self, markers):
+        self._analysis_markers = markers
+        self.update()
 
     def set_slice_regions(self, regions: List[dict], selected_index: Optional[int] = None) -> None:
         self._slice_regions = regions
@@ -78,6 +85,14 @@ class TimelineSlider(QSlider):
         return None, None
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and event.position().y() >= self.height()-13:
+            for marker in reversed(self._analysis_markers):
+                x0=self._value_to_x(marker['start_value'])
+                x1=self._value_to_x(marker['end_value'])
+                if min(x0,x1)-4 <= event.position().x() <= max(x0,x1)+4:
+                    self.markerSelected.emit(marker['index'])
+                    event.accept()
+                    return
         if self.orientation() == Qt.Horizontal and event.button() == Qt.LeftButton and self._slice_regions:
             idx, mode = self._hit_test_slice(event.position().x(), event.position().y())
             if idx is not None:
@@ -146,6 +161,13 @@ class TimelineSlider(QSlider):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
+
+        if self._analysis_markers:
+            painter=QPainter(self)
+            for marker in self._analysis_markers:
+                x0=self._value_to_x(marker['start_value']);x1=self._value_to_x(marker['end_value'])
+                painter.fillRect(x0,self.height()-10,max(3,x1-x0),6,QColor(marker.get('color','#ffd60a')))
+            painter.end()
 
         if self.orientation() != Qt.Horizontal:
             return
