@@ -36,6 +36,7 @@ def validate_settings(session):
         if key in view and view[key] <= 0:
             raise ValueError(f"Session {key} must be positive.")
     limits = {
+        "arrow_quality": (0,1),
         "window_ms": (0.001, 1e12),
         "persistence_ms": (0.001, 60000),
         "glow_intensity": (0, 3),

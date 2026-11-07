@@ -88,23 +88,11 @@ def legacy_trail(events, hw, t0, t1, polarity="both"):
     return (image * 255).astype(np.uint8)
 
 
-def motion_arrows(events, hw, t0, t1, polarity="both", grid=24, scale=2., minimum=10, silhouette=.4):
+def motion_arrows(events, hw, t0, t1, polarity="both", grid=24, scale=1., minimum=10, silhouette=.4, quality=.65):
     heat, _ = heatmap(events, hw, t0, t1, polarity)
     canvas = np.clip(np.array([24, 34, 58]) * (1 - silhouette) + heat * silhouette, 0, 255).astype(np.uint8)
-    columns = (hw[1] + grid - 1) // grid
-    cells = columns * ((hw[0] + grid - 1) // grid)
-    halves = []
-    middle = t0 + (t1 - t0) // 2
-    for start, end in ((t0, middle), (middle, t1)):
-        batch = select(events, start, end, polarity=polarity)
-        ids = (batch.y // grid) * columns + batch.x // grid
-        count = np.bincount(ids, minlength=cells)
-        x = np.bincount(ids, weights=batch.x, minlength=cells) / np.maximum(count, 1)
-        y = np.bincount(ids, weights=batch.y, minlength=cells) / np.maximum(count, 1)
-        halves.append((count, x, y))
-    (na, ax, ay), (nb, bx, by) = halves
-    dx, dy = bx - ax, by - ay
-    magnitude = np.hypot(dx, dy)
+    from .motion_field import estimate_motion_field
+    vectors = estimate_motion_field(events, hw, t0, t1, polarity, grid, minimum, quality)
 
     def line(x0, y0, x1, y1, color):
         length = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
@@ -113,14 +101,20 @@ def motion_arrows(events, hw, t0, t1, polarity="both", grid=24, scale=2., minimu
         valid = (xs >= 0) & (ys >= 0) & (xs < hw[1]) & (ys < hw[0])
         canvas[ys[valid], xs[valid]] = color
 
-    for i in np.flatnonzero((na >= minimum) & (nb >= minimum) & (magnitude >= 1.3)):
-        x0, y0 = (ax[i] + bx[i]) / 2, (ay[i] + by[i]) / 2
-        x1, y1 = x0 + dx[i] * scale, y0 + dy[i] * scale
-        color = time_colors(np.array([min(1., magnitude[i] / max(3., grid * .45))]))[0] * 255
+    drawn = []
+    for vector in sorted(vectors,key=lambda v:(-v['correlation'],v['y'],v['x'])):
+        x0, y0 = vector["x"], vector["y"]
+        if any(np.hypot(x0-x,y0-y)<grid*.65 for x,y in drawn):
+            continue
+        drawn.append((x0,y0))
+        dx, dy = vector["dx_px"], vector["dy_px"]
+        x1, y1 = x0 + dx * scale, y0 + dy * scale
+        color = (70, 210, 255)
         line(x0, y0, x1, y1, color)
         angle = np.arctan2(y1-y0, x1-x0)
+        head = min(6., max(1.5, np.hypot(dx, dy) * scale * .4))
         for rotation in (-.6, .6):
-            line(x1, y1, x1 - 6 * np.cos(angle + rotation), y1 - 6 * np.sin(angle + rotation), color)
+            line(x1, y1, x1 - head * np.cos(angle + rotation), y1 - head * np.sin(angle + rotation), color)
     return canvas
 
 
@@ -137,6 +131,6 @@ def render_frame(events, hw, t0, window_us, mode, parameters):
         return legacy_trail(events, hw, t0, end, polarity)
     if mode == "MOTION ARROWS":
         return motion_arrows(events, hw, t0, end, polarity, parameters.get("grid", 24),
-                             parameters.get("scale", 2.), parameters.get("minimum", 10),
-                             parameters.get("silhouette", .4))
+                             parameters.get("scale", 1.), parameters.get("minimum", 10),
+                             parameters.get("silhouette", .4), parameters.get("arrow_quality", .65))
     return raw(events, hw, t0, end, polarity)

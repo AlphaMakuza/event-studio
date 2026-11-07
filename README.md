@@ -81,7 +81,7 @@ their DERIVED classification when reloaded with their metadata sidecar.
 | Density Heatmap | DERIVED | Counts over the current interval; selectable log-relative, linear-relative, or fixed 100-events/pixel scale |
 | Polarity Glow | STYLIZED | Polarity presence with an explicit adjustable 5×5 spatial halo |
 | TRAIL | DERIVED | Preserved legacy time-colored accumulation, log scaling and relative normalization |
-| Motion Arrows | DERIVED | Preserved legacy two-half-window centroid displacement estimates; not measured optical flow |
+| Motion Arrows | DERIVED | Local polarity-separated log-count patch matching, with texture, uniqueness and reverse-consistency checks; unresolved motion is omitted |
 
 **Compare with unfiltered RAW** synchronizes both images on one dataset,
 interval, and shared ROIs. It also provides before/after polarity-filter

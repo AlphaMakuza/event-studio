@@ -277,18 +277,20 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(self.heat_scale)
 
         arrow_row1 = QHBoxLayout()
-        arrow_row1.addWidget(QLabel("Grid"))
+        arrow_row1.addWidget(QLabel("Spacing px"))
         self.arrow_grid_spin = QSpinBox()
         self.arrow_grid_spin.setRange(8, 128)
         self.arrow_grid_spin.setValue(24)
         self.arrow_grid_spin.valueChanged.connect(self._render_from_ui)
         arrow_row1.addWidget(self.arrow_grid_spin)
 
-        arrow_row1.addWidget(QLabel("Scale"))
+        arrow_row1.addWidget(QLabel("Display ×"))
         self.arrow_scale_spin = QDoubleSpinBox()
         self.arrow_scale_spin.setRange(0.2, 10.0)
         self.arrow_scale_spin.setSingleStep(0.2)
-        self.arrow_scale_spin.setValue(2.0)
+        self.arrow_scale_spin.setValue(1.0)
+        self.arrow_grid_spin.setToolTip("Arrow sampling spacing; matching patches are twice this size. Search radius is half the spacing. Larger spacing adds context but can combine distinct motions.")
+        self.arrow_scale_spin.setToolTip("Glyph length multiplier only. 1× displays the estimated pixel displacement between the two half-windows.")
         self.arrow_scale_spin.valueChanged.connect(self._render_from_ui)
         arrow_row1.addWidget(self.arrow_scale_spin)
         view_layout.addLayout(arrow_row1)
@@ -309,7 +311,17 @@ class MainWindow(QMainWindow):
         self.arrow_silhouette_spin.valueChanged.connect(self._render_from_ui)
         arrow_row2.addWidget(self.arrow_silhouette_spin)
         view_layout.addLayout(arrow_row2)
-        self.arrow_widgets = [layout.itemAt(i).widget() for layout in (arrow_row1, arrow_row2)
+        arrow_row3=QHBoxLayout()
+        arrow_row3.addWidget(QLabel('Match quality'))
+        self.arrow_quality_spin=QDoubleSpinBox()
+        self.arrow_quality_spin.setRange(0,1)
+        self.arrow_quality_spin.setSingleStep(.05)
+        self.arrow_quality_spin.setValue(.65)
+        self.arrow_quality_spin.setToolTip('Minimum normalized patch correlation. Ambiguous, one-dimensional, stationary, search-limit and reverse-inconsistent matches are also suppressed. This is not a confidence probability.')
+        self.arrow_quality_spin.valueChanged.connect(self._render_from_ui)
+        arrow_row3.addWidget(self.arrow_quality_spin)
+        view_layout.addLayout(arrow_row3)
+        self.arrow_widgets = [layout.itemAt(i).widget() for layout in (arrow_row1, arrow_row2, arrow_row3)
                               for i in range(layout.count())]
 
         self.middle_panel.addWidget(view_box)
@@ -817,7 +829,7 @@ class MainWindow(QMainWindow):
             VIEW_MODE_PERSISTENCE: "DERIVED • latest real event per polarity/pixel, linear decay to zero over the persistence duration, ending at the interval's exclusive end.",
             VIEW_MODE_GLOW: "STYLIZED • polarity presence plus a 5×5 spatial halo. Halo pixels are styling, not additional events.",
             VIEW_MODE_TRAIL: "DERIVED • legacy time-colored accumulation in this interval; logarithmic scaling and relative normalization. No fading decay.",
-            VIEW_MODE_MOTION_ARROWS: "DERIVED • legacy grid centroid displacement estimate, not measured optical flow. Two half-windows, minimum-event and displacement thresholds; normalized heatmap backdrop.",
+            VIEW_MODE_MOTION_ARROWS: "DERIVED • local polarity-separated log-count pattern matching between the two half-windows. Only textured, unique, reverse-consistent matches are drawn; no arrow means motion is unresolved or stationary. Search limit = half the spacing. Display × changes glyph length only. Not calibrated optical flow.",
         }
         prefix = "DERIVED filtered view: " + str(self.filter_settings) + "\n" if self.filtered_events is not None else ""
         if inherited:
@@ -1159,6 +1171,8 @@ class MainWindow(QMainWindow):
                 "arrow_scale": float(self.arrow_scale_spin.value()),
                 "arrow_min_events": int(self.arrow_min_events_spin.value()),
                 "arrow_silhouette": float(self.arrow_silhouette_spin.value()),
+                "arrow_quality": self.arrow_quality_spin.value(),
+                "arrow_algorithm": "local-ncc-v1",
             },
             "rois": [self._roi_to_dict(r) for r in self.rois],
             "slices": [self._slice_to_dict(s) for s in self.slices],
@@ -1490,7 +1504,8 @@ class MainWindow(QMainWindow):
         should_resume_playing = bool(view.get("is_playing", False))
 
         self.arrow_grid_spin.setValue(int(view.get("arrow_grid", 24)))
-        self.arrow_scale_spin.setValue(float(view.get("arrow_scale", 2.0)))
+        self.arrow_scale_spin.setValue(float(view.get("arrow_scale", 1.0)))
+        self.arrow_quality_spin.setValue(float(view.get('arrow_quality',.65)))
         self.arrow_min_events_spin.setValue(int(view.get("arrow_min_events", 10)))
         self.arrow_silhouette_spin.setValue(float(view.get("arrow_silhouette", 0.40)))
 
@@ -1618,6 +1633,8 @@ class MainWindow(QMainWindow):
                 "persistence_us": int(round(self.persistence_ms.value() * 1000)),
                 "glow": self.glow_intensity.value(), "grid": self.arrow_grid_spin.value(),
                 "scale": self.arrow_scale_spin.value(), "minimum": self.arrow_min_events_spin.value(),
+                "arrow_quality": self.arrow_quality_spin.value(),
+                "arrow_algorithm": "local-ncc-v1",
                 "silhouette": self.arrow_silhouette_spin.value()}
 
     def _render_mode_frame(self, t0: int, window_us: int) -> np.ndarray:
