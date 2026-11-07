@@ -8,18 +8,13 @@ them; buffer evictions below are only application display-buffer measurements.
 from collections import deque
 from threading import Lock
 from pathlib import Path
-import csv
-import importlib.util
+from queue import Queue, Empty
+import time
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 from .viewer import EventBatch
-from .project_utils import save_json
-from .science import fingerprint
-from .version import __version__
-
-
-def sdk_available():
-    return importlib.util.find_spec("metavision_core") is not None
+from .camera_discovery import sdk_available
+from .capture_recording import CaptureRecording
 
 
 class EventBuffer:
@@ -32,6 +27,7 @@ class EventBuffer:
         self.evicted = 0
         self.received = 0
         self.last_t = None
+        self.last_delivery = None
         self.lock = Lock()
 
     def push(self, structured):
@@ -66,6 +62,7 @@ class EventBuffer:
                     "Camera timestamp reset; capture stopped without rewriting timestamps."
                 )
             self.last_t = int(t[-1])
+            self.last_delivery = time.monotonic()
             self.received += len(t)
             self.batches.append(batch)
             self.size += len(t)
@@ -85,12 +82,29 @@ class EventBuffer:
                         array.flags.writeable = False
                     self.batches.appendleft(EventBatch(*retained))
 
-    def snapshot(self, hw):
+    def snapshot(self, hw, lookback_us=None):
         with self.lock:
             batches = list(self.batches)
             evicted, received = self.evicted, self.received
+            history_start = int(batches[0].t[0]) if batches else None
+            history_end = self.last_t + 1 if self.last_t is not None else None
+            last_delivery = self.last_delivery
         if not batches:
             return None
+        if lookback_us is not None:
+            if lookback_us < 1:
+                raise ValueError("Preview history must be positive.")
+            cutoff = history_end - lookback_us
+            batches = [
+                EventBatch(
+                    *(
+                        getattr(batch, key)[int(np.searchsorted(batch.t, cutoff)) :]
+                        for key in ("t", "x", "y", "p")
+                    )
+                )
+                for batch in batches
+                if int(batch.t[-1]) >= cutoff
+            ]
         arrays = [
             np.concatenate([getattr(batch, key) for batch in batches])
             for key in ("t", "x", "y", "p")
@@ -108,6 +122,9 @@ class EventBuffer:
                 "display_buffer_evicted_events": evicted,
                 "received_events": received,
                 "hardware_dropped_events": None,
+                "buffer_start_us": history_start,
+                "buffer_end_us": history_end,
+                "last_delivery_monotonic": last_delivery,
             },
         )
 
@@ -116,6 +133,8 @@ class CameraWorker(QThread):
     geometry = Signal(int, int)
     status = Signal(str)
     failed = Signal(str)
+    recording_changed = Signal(bool, str)
+    recording_failed = Signal(str)
 
     def __init__(
         self, buffer, serial="", record_path=None, iterator_factory=None, parent=None
@@ -125,23 +144,44 @@ class CameraWorker(QThread):
         self.serial = serial
         self.record_path = Path(record_path) if record_path else None
         self.iterator_factory = iterator_factory
+        self.commands = Queue()
+        self.error_message = None
+
+    def request_recording(self, path=None):
+        """Queue a recording start, or None to stop. File I/O stays in this thread."""
+        self.commands.put(Path(path) if path else None)
 
     def run(self):
-        stream = None
-        written = 0
+        recorder = None
+        iterator = None
         hw = None
         failure = None
-        iterator = None
+
+        def finish_recording(reason, error=None):
+            nonlocal recorder
+            if recorder is None:
+                return
+            current, recorder = recorder, None
+            try:
+                current.close(reason, self.buffer, error)
+            except Exception as exc:
+                self.recording_failed.emit(f"Recording could not be finalized: {exc}")
+            finally:
+                self.recording_changed.emit(False, str(current.path))
+
+        def begin_recording(path):
+            nonlocal recorder
+            if recorder is not None:
+                self.recording_failed.emit("A recording is already running.")
+                return
+            try:
+                recorder = CaptureRecording(path, self.serial, hw, self.buffer.received)
+                self.recording_changed.emit(True, str(recorder.path))
+            except Exception as exc:
+                self.recording_failed.emit(f"Recording could not start: {exc}")
+                self.recording_changed.emit(False, str(path))
+
         try:
-            if self.record_path:
-                if self.record_path.suffix.lower() != ".csv":
-                    raise ValueError("Live recording requires a .csv filename.")
-                if self.record_path.with_suffix(".json").exists():
-                    raise FileExistsError("Recording metadata already exists.")
-                self.record_path.parent.mkdir(parents=True, exist_ok=True)
-                stream = self.record_path.open("x", encoding="utf-8", newline="")
-                writer = csv.writer(stream)
-                writer.writerow(("t", "x", "y", "p"))
             if self.iterator_factory:
                 iterator = self.iterator_factory()
             else:
@@ -152,15 +192,29 @@ class CameraWorker(QThread):
                 )
             hw = iterator.get_size()
             if (
-                not all(isinstance(value, int) and value > 0 for value in hw)
+                not all(
+                    isinstance(value, (int, np.integer)) and value > 0 for value in hw
+                )
                 or hw[0] * hw[1] > 16_777_216
             ):
                 raise ValueError("Camera did not report supported sensor dimensions.")
+            hw = tuple(map(int, hw))
             self.geometry.emit(*hw)
-            self.status.emit("Acquiring • hardware drop count unknown")
+            if self.record_path:
+                begin_recording(self.record_path)
+            self.status.emit("Acquiring")
             for batch in iterator:
                 if self.isInterruptionRequested():
                     break
+                while True:
+                    try:
+                        command = self.commands.get_nowait()
+                    except Empty:
+                        break
+                    if command is None:
+                        finish_recording("recording stopped")
+                    else:
+                        begin_recording(command)
                 if not len(batch):
                     continue
                 if np.any(batch["x"] >= hw[1]) or np.any(batch["y"] >= hw[0]):
@@ -168,62 +222,28 @@ class CameraWorker(QThread):
                         "Camera event coordinates exceed its sensor dimensions."
                     )
                 self.buffer.push(batch)
-                if stream:
-                    writer.writerows(
-                        zip(batch["t"], batch["x"], batch["y"], batch["p"])
-                    )
-                    written += len(batch)
+                if recorder is not None:
+                    try:
+                        recorder.write(batch)
+                    except Exception as exc:
+                        self.recording_failed.emit(f"Recording write failed: {exc}")
+                        finish_recording("failed", str(exc))
             self.status.emit(
                 "Stopped"
                 if self.isInterruptionRequested()
-                else "Source ended / disconnected"
+                else "Camera stream ended or disconnected"
             )
         except Exception as exc:
-            failure = str(exc)
+            failure = self.error_message = str(exc)
             self.failed.emit(failure)
         finally:
-            # Release the SDK/device in the acquisition thread, not the GUI.
             if iterator is not None:
                 del iterator
-            if stream:
-                stream.close()
-                try:
-                    save_json(
-                        self.record_path.with_suffix(".json"),
-                        {
-                            "software_version": __version__,
-                            "acquisition": {
-                                "adapter": "Metavision EventsIterator",
-                                "serial": self.serial,
-                                "timestamp_unit": "us",
-                                "timestamps_rebased": False,
-                                "received_events": self.buffer.received,
-                                "recorded_rows_lower_bound": written,
-                                "hardware_dropped_events": None,
-                                "display_buffer_evicted_events": self.buffer.evicted,
-                                "status": (
-                                    "failed"
-                                    if failure
-                                    else (
-                                        "stopped"
-                                        if self.isInterruptionRequested()
-                                        else "source ended"
-                                    )
-                                ),
-                                "error": failure,
-                                "loss_claim": "No claim of zero acquisition loss; SDK/hardware losses are not measured.",
-                            },
-                            "sensor_resolution": (
-                                {
-                                    "width": hw[1],
-                                    "height": hw[0],
-                                    "origin": "camera SDK",
-                                }
-                                if hw
-                                else {}
-                            ),
-                            "csv_sha256": fingerprint(self.record_path),
-                        },
-                    )
-                except Exception as exc:
-                    self.failed.emit(f"Recording metadata failed: {exc}")
+            finish_recording(
+                (
+                    "failed"
+                    if failure
+                    else "stopped" if self.isInterruptionRequested() else "source ended"
+                ),
+                failure,
+            )

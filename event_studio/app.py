@@ -702,11 +702,8 @@ class MainWindow(QMainWindow):
         self._workspace.raise_()
 
     def _open_live_window(self):
-        from .live_window import LiveWindow
-        if self._live_window is None:
-            self._live_window=LiveWindow(self)
-        self._live_window.show()
-        self._live_window.raise_()
+        from .live_window import show_live_camera
+        self._live_window=show_live_camera()
 
     def _apply_filter_settings(self, settings, after=None):
         from .filters import apply_filters
@@ -996,8 +993,8 @@ class MainWindow(QMainWindow):
         self._render_from_ui()
 
     def closeEvent(self, event) -> None:
-        if self._live_window is not None and self._live_window.worker is not None:
-            self._live_window.stop_camera()
+        if self._live_window is not None and self._live_window.parent() is self and self._live_window.is_busy():
+            self._live_window.close()
             event.ignore()
             return
         if self._task is not None:

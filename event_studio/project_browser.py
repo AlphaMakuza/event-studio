@@ -163,6 +163,10 @@ class ProjectBrowser(QMainWindow):
         header.addWidget(title)
         header.addStretch(1)
 
+        self.btn_live = QPushButton("Live Camera")
+        self.btn_live.clicked.connect(self._open_live_camera)
+        header.addWidget(self.btn_live)
+
         self.btn_new = QPushButton("New Project")
         self.btn_new.clicked.connect(self._create_project)
         header.addWidget(self.btn_new)
@@ -190,6 +194,10 @@ class ProjectBrowser(QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+
+    def _open_live_camera(self) -> None:
+        from .live_window import show_live_camera
+        self._live_window = show_live_camera()
 
     def refresh_projects(self) -> None:
         self._clear_grid()

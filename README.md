@@ -8,6 +8,11 @@ The V2 development build adds **Analysis → Advanced Analysis** (`Ctrl+Shift+A`
 for activity comparison, deterministic burst detection, annotations, frequency
 analysis, estimated motion, explicit filters, batch analysis, and visual export.
 See [V2 methods, usage, and verification limits](docs/V2.md).
+**Live Camera** is also available directly on the project-browser screen.
+It automatically lists compatible connected event cameras and previews the
+selected camera, with the same RAW/Studio visualization choices. A native
+Metavision SDK and matching device driver are required; missing camera support
+is reported separately from a successful scan with no cameras detected.
 
 ## Run
 
