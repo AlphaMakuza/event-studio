@@ -62,12 +62,13 @@ from .analysis_window import ROIAnalysisPanel
 from .timeline_slider import TimelineSlider
 
 
-def _try_show_boot(app: QApplication) -> None:
+def _try_show_boot(app: QApplication, on_done=None) -> None:
     try:
         from .boot import show_boot  # type: ignore
-        app.boot_overlay = show_boot(app)  # keep startup/audio alive
+        app.boot_overlay = show_boot(app, on_done=on_done)  # keep startup/audio alive
     except Exception:
-        return
+        if on_done:
+            on_done()
 
 
 ROI_COLOR_PALETTE = [
@@ -2432,7 +2433,6 @@ def main() -> None:
     app = QApplication(sys.argv)
     from .theme import configure_application
     configure_application(app)
-    _try_show_boot(app)
 
     project_root = Path(__file__).resolve().parents[1]
     projects_root = project_root / "projects"
@@ -2450,7 +2450,7 @@ def main() -> None:
         win.destroyed.connect(lambda _=None, window=win: windows.remove(window) if window in windows else None)
 
     browser = ProjectBrowser(projects_root=projects_root, open_project_callback=open_project)
-    browser.show()
+    _try_show_boot(app, on_done=browser.show)
 
     sys.exit(app.exec())
 

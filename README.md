@@ -14,6 +14,12 @@ selected camera, with the same RAW/Studio visualization choices. A native
 Metavision SDK and matching device driver are required; missing camera support
 is reported separately from a successful scan with no cameras detected.
 
+The homepage offers **Image + text**, **Text only**, and **Large tiles** views,
+with project/dataset search and sorting by name or last save. Your view choice
+is remembered. Startup shows the transparent logo and retro loading label;
+the homepage opens when the startup song finishes, with a fallback if audio
+cannot play.
+
 ## Run
 
 Windows PowerShell, from this directory:

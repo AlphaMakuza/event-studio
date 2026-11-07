@@ -61,3 +61,16 @@ but the earlier real recording accepted only one of 149 advanced-tracker links
 at default settings. Display arrows can also be costly on dense scenes. The
 current implementation has no claim of subpixel accuracy or universal real-time
 motion tracking. See [V2 methods and limits](V2.md).
+
+## Homepage and startup follow-up
+
+The refreshed homepage adds image rows, text-only rows and responsive tiles,
+with remembered view preference, search and sorting. All 79 tests pass in both
+dependency environments after these changes. GUI fixtures are disposed on the
+GUI thread before acquisition-worker tests run.
+
+A native Windows startup check with muted sound verified that the browser
+remained hidden throughout playback and appeared at 10.546 seconds, after the
+audio stopped. The transparent splash uses the existing logo and a white pixel
+loading PNG. Missing/broken audio has a fallback reveal. Local screenshots and
+the startup timing record are under `artifacts/homepage/`.
