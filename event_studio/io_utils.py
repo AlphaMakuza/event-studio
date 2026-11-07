@@ -7,16 +7,25 @@ import shutil
 import tempfile
 
 
+class CommitRecoveryError(RuntimeError):
+    """Output rollback failed; recovery copies remain at recovery_directory."""
+
+    def __init__(self, message, recovery_directory):
+        super().__init__(message)
+        self.recovery_directory = Path(recovery_directory)
+
+
 def commit_pair(data, metadata, destination, sidecar):
     targets = [Path(destination), Path(sidecar)]
-    with tempfile.TemporaryDirectory(
-        prefix="rollback-", dir=targets[0].parent
-    ) as directory:
+    parent = targets[0].parent.resolve()
+    directory = Path(tempfile.mkdtemp(prefix="rollback-", dir=parent)).resolve()
+    retain_recovery = False
+    try:
         backups = []
         for i, target in enumerate(targets):
-            backup = Path(directory) / str(i)
+            backup = directory / f"{i}.previous"
             if target.exists():
-                shutil.copy2(target, backup)
+                shutil.copyfile(target, backup)
                 backups.append(backup)
             else:
                 backups.append(None)
@@ -25,13 +34,53 @@ def commit_pair(data, metadata, destination, sidecar):
             for source, target in zip((data, metadata), targets):
                 os.replace(source, target)
                 committed += 1
-        except Exception:
+        except Exception as original:
+            failures = []
             for target, backup in zip(targets[:committed], backups[:committed]):
-                if backup is None:
-                    target.unlink(missing_ok=True)
-                else:
-                    shutil.copy2(backup, target)
+                try:
+                    if backup is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        shutil.copyfile(backup, target)
+                except Exception as exc:
+                    failures.append(
+                        {"target": str(target.resolve()), "error": str(exc)}
+                    )
+            if failures:
+                retain_recovery = True
+                import json
+
+                journal = {
+                    "original_error": str(original),
+                    "rollback_failures": failures,
+                    "backups": [
+                        {
+                            "target": str(target.resolve()),
+                            "backup": str(backup) if backup else None,
+                        }
+                        for target, backup in zip(targets, backups)
+                    ],
+                }
+                try:
+                    (directory / "recovery.json").write_text(
+                        json.dumps(journal, indent=2), encoding="utf-8"
+                    )
+                except OSError:
+                    pass  # Keep the actual previous files even if journaling fails.
+                raise CommitRecoveryError(
+                    f"Export failed and the previous output could not be fully restored. Recovery copies were retained at {directory}",
+                    directory,
+                ) from original
             raise
+    finally:
+        if not retain_recovery:
+            # Delete only the exact temporary directory created under this
+            # explicitly selected output parent, never an unchecked path.
+            if directory.parent != parent or not directory.name.startswith("rollback-"):
+                raise RuntimeError(
+                    "Recovery cleanup path escaped its output directory."
+                )
+            shutil.rmtree(directory)
 
 
 def export_table(path, columns, rows, metadata):

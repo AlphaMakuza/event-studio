@@ -26,6 +26,11 @@ For a new environment, create a Python 3.12 virtual environment and install
 `requirements.txt`. Development was verified with Python 3.12.10, NumPy 2.4.0,
 PySide6 6.10.1, and Matplotlib 3.10.8.
 
+For optional MP4 export, also install `requirements-video.txt`, or provide an
+FFmpeg executable on PATH. PNG export needs no additional package.
+See the [acceptance report](docs/ACCEPTANCE.md) for verified behavior and
+remaining hardware checks.
+
 CSV exploration requires only the Python dependencies. DAT/H5 conversion also
 requires WSL and OpenEB's `metavision_file_to_hdf5` and
 `metavision_file_to_csv`. The converter probes the existing OpenEB build paths

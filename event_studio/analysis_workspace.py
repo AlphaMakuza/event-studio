@@ -928,7 +928,8 @@ class AnalysisWorkspace(QWidget):
         self.overlay_check = QCheckBox("Visible ROI overlays")
         self.overlay_check.setChecked(True)
         form.addRow(self.overlay_check)
-        self.mp4 = QCheckBox("Also encode MP4 (requires FFmpeg on PATH)")
+        self.mp4 = QCheckBox("Also encode MP4")
+        self.mp4.setToolTip('Uses FFmpeg on PATH or the optional requirements-video.txt backend.')
         form.addRow(self.mp4)
         self.button(form, "Export current mode as PNG sequence", self.export_visual)
         label = QLabel(

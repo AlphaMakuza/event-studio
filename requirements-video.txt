@@ -1,0 +1,2 @@
+# Optional MP4 encoder backend, bundled by imageio-ffmpeg for supported platforms.
+imageio-ffmpeg>=0.8.1,<0.9
