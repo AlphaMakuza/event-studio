@@ -6,6 +6,7 @@ class Task(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
     progress = Signal(int, str)
+    cancelled = Signal(str)
 
     def __init__(self, function, parent=None):
         super().__init__(parent)
@@ -15,4 +16,8 @@ class Task(QThread):
         try:
             self.succeeded.emit(self.function())
         except Exception as exc:
-            self.failed.emit(str(exc))
+            from .filters import CancelledError
+            if isinstance(exc,CancelledError):
+                self.cancelled.emit(str(exc))
+            else:
+                self.failed.emit(str(exc))

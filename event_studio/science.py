@@ -102,6 +102,16 @@ def load_csv(path, max_events=None):
     if sidecar.exists():
         try:
             saved = json.loads(sidecar.read_text(encoding="utf-8"))
+            if saved.get('csv_sha256') and saved['csv_sha256']!=metadata['sha256']:
+                raise ValueError('CSV content does not match its metadata sidecar hash.')
+            if saved.get('acquisition'):
+                metadata['acquisition']=saved['acquisition']
+            if saved.get('selection'):
+                metadata['source_selection']=saved['selection']
+            upstream=saved.get('source',{})
+            if any(upstream.get('filters',{}).values()) or upstream.get('classification')=='DERIVED':
+                metadata['classification']='DERIVED'
+                metadata['inherited_processing']={'source':upstream,'selection':saved.get('selection')}
             resolution = saved.get("sensor_resolution", {})
             width, height = int(resolution["width"]), int(resolution["height"])
             if width < metadata["resolution"][0] or height < metadata["resolution"][1]:

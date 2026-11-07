@@ -4,6 +4,11 @@ A scientific instrument with a studio layer on top. Explore event-camera
 recordings, isolate precise intervals and spatial probes, measure events,
 export original event tuples, and save reproducible sessions.
 
+The V2 development build adds **Analysis → Advanced Analysis** (`Ctrl+Shift+A`)
+for activity comparison, deterministic burst detection, annotations, frequency
+analysis, estimated motion, explicit filters, batch analysis, and visual export.
+See [V2 methods, usage, and verification limits](docs/V2.md).
+
 ## Run
 
 Windows PowerShell, from this directory:
@@ -61,6 +66,11 @@ analysis panel explicitly displays unfiltered full-recording/current-window
 analysis and discloses its presentation sampling.
 The positive/negative ratio displays `inf` for positive-only selections and
 uses zero for an empty selection; counts remain visible beside the ratio.
+Optional refractory, prior-neighbor-support, and hot-pixel filters are available
+in the analysis workspace. The main view and its window/probe statistics use
+the derived view; the separate legacy ROI analysis panel stays explicitly
+unfiltered. New slices capture filter parameters, and filtered exports retain
+their DERIVED classification when reloaded with their metadata sidecar.
 
 ## Scientific and Studio views
 
@@ -94,10 +104,11 @@ Rendering parameters never change event CSV exports.
   Otherwise it is labeled **inferred from observed coordinates**: inactive
   sensor edges cannot be recovered from event coordinates alone. Rendering
   supports up to 16 megapixels.
-- Session format 7 preserves exact position/duration, zoom, step, ROIs, slices,
+- Session format 8 preserves exact position/duration, zoom, step, ROIs, slices,
   polarity filter, comparison state, sensor metadata, and visualization
-  parameters. Versions 1–6 migrate on load, accounting for their old capped
-  timeline and skipped headerless first row. New saves use version 7.
+  parameters, advanced analysis settings, filters, annotations, and detected
+  intervals. Versions 1–7 remain readable, accounting for their old capped
+  timeline and skipped headerless first row. New saves use version 8.
 - Loading old sessions now loads the full recording. Old global statistics
   may change because the old implementation loaded at most two million
   events. Old slices acquire spatial snapshots during migration.
@@ -120,8 +131,10 @@ offscreen platform during tests.
 The real CARS CSV was loaded and exported/reloaded with **4,829,705 events**;
 all timestamps, coordinates, and polarities matched exactly. The existing real
 DAT recording also passed the WSL/OpenEB DAT → H5 → CSV pipeline with the same
-event count. Manual desktop
-interaction and audio-device behavior still merit verification on the target
-Windows desktop. Recordings currently reside in RAM; out-of-core processing,
-arbitrary scientific denoisers, and cancellation of running OpenEB jobs are
-not implemented. No hidden denoising or automatic interpretation is applied.
+event count. V2 adds synthetic frequency/displacement validation, workspace and
+filter-session integration tests, and simulated camera recording/buffer tests.
+Native Windows early audio stopping was verified after replacing the WAV media
+pipeline with Qt's short-sound player; physical audible output remains untested.
+Recordings currently reside in RAM. Offline V2 jobs support cooperative
+cancellation; running OpenEB conversion jobs do not. No hidden denoising or
+automatic scientific interpretation is applied.

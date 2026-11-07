@@ -173,6 +173,7 @@ class MainWindow(QMainWindow):
         self.annotations = []
         self.detections = []
         self._workspace = None
+        self._live_window = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -601,6 +602,9 @@ class MainWindow(QMainWindow):
         analysis_action.setShortcut("Ctrl+Shift+A")
         analysis_action.triggered.connect(self._open_analysis_workspace)
         analysis_menu.addAction(analysis_action)
+        live_action = QAction("Live camera…",self)
+        live_action.triggered.connect(self._open_live_window)
+        analysis_menu.addAction(live_action)
 
         self.statusBar().showMessage("Ready")
         self._update_window_title()
@@ -652,11 +656,27 @@ class MainWindow(QMainWindow):
 
         task.succeeded.connect(success)
         task.failed.connect(lambda error: QMessageBox.critical(self, "Operation failed", error))
+        task.cancelled.connect(self.statusBar().showMessage)
         task.finished.connect(cleanup)
         task.start()
 
     def _display_events(self):
         return self.filtered_events if self.filtered_events is not None else self.events
+
+    def _window_batch(self,t0,t1):
+        key=(id(self._display_events()),t0,t1,self.polarity_combo.currentText())
+        if getattr(self,'_window_cache_key',None)!=key:
+            self._window_cache_key=key
+            self._window_cache=select(self._display_events(),t0,t1,polarity=key[-1])
+            self._probe_cache={}
+        return self._window_cache
+
+    def _probe_stats(self,roi,t0,t1):
+        batch=self._window_batch(t0,t1)
+        key=(roi.x,roi.y,roi.w,roi.h)
+        if key not in self._probe_cache:
+            self._probe_cache[key]=compute_roi_stats(batch,self.hw,roi,t0,t1-t0)
+        return self._probe_cache[key]
 
     def _open_analysis_workspace(self):
         if self.events is None:
@@ -665,9 +685,16 @@ class MainWindow(QMainWindow):
         from .analysis_workspace import AnalysisWorkspace
         if self._workspace is None:
             self._workspace = AnalysisWorkspace(self)
-        self._workspace.use_current_interval()
+        self._workspace.restore_settings()
         self._workspace.show()
         self._workspace.raise_()
+
+    def _open_live_window(self):
+        from .live_window import LiveWindow
+        if self._live_window is None:
+            self._live_window=LiveWindow(self)
+        self._live_window.show()
+        self._live_window.raise_()
 
     def _apply_filter_settings(self, settings, after=None):
         from .filters import apply_filters
@@ -768,8 +795,10 @@ class MainWindow(QMainWindow):
 
     def _update_mode_description(self) -> None:
         mode = self.current_view_mode
-        classification = "RAW" if mode == VIEW_MODE_RAW else "STYLIZED" if mode == VIEW_MODE_GLOW else "DERIVED"
+        inherited=self.events is not None and self.events.metadata.get('classification')=='DERIVED'
+        classification = "RAW" if mode == VIEW_MODE_RAW and not inherited else "STYLIZED" if mode == VIEW_MODE_GLOW else "DERIVED"
         self.view_box.setTitle(f"{classification} • {mode}")
+        self.compare_box.setTitle('DERIVED • unfiltered loaded file' if inherited else 'RAW • unfiltered reference')
         for widget in (self.persistence_label, self.persistence_ms):
             widget.setVisible(mode == VIEW_MODE_PERSISTENCE)
         for widget in (self.glow_label, self.glow_intensity):
@@ -791,15 +820,16 @@ class MainWindow(QMainWindow):
             VIEW_MODE_MOTION_ARROWS: "DERIVED • legacy grid centroid displacement estimate, not measured optical flow. Two half-windows, minimum-event and displacement thresholds; normalized heatmap backdrop.",
         }
         prefix = "DERIVED filtered view: " + str(self.filter_settings) + "\n" if self.filtered_events is not None else ""
+        if inherited:
+            prefix='Loaded file has DERIVED processing provenance; original acquisition events are not reconstructed.\n'+prefix
         if self.filtered_events is not None:
             self.view_box.setTitle("DERIVED filtered | " + mode)
         self.view_mode_hint.setText(prefix + descriptions[mode] + "\nPolarity filter: " + self.polarity_combo.currentText())
 
     def _update_probe_table(self, t0, t1) -> None:
-        batch = select(self._display_events(), t0, t1, polarity=self.polarity_combo.currentText())
         self.roi_table.setRowCount(len(self.rois))
         for row, item in enumerate(self.rois):
-            stats = compute_roi_stats(batch, self.hw, item.roi, t0, t1 - t0)
+            stats = self._probe_stats(item.roi,t0,t1)
             values = (item.name, str(stats.n_events), f"{stats.pos} / {stats.neg}",
                       f"{stats.events_per_ms:.4f}", str(stats.active_pixels))
             for column, value in enumerate(values):
@@ -870,6 +900,9 @@ class MainWindow(QMainWindow):
         self.events = replace(self.events, metadata={**self.events.metadata,
                               "resolution": [width, height], "resolution_origin": "user-specified sensor dimensions"})
         self.hw = height, width
+        if self.filtered_events is not None:
+            self.filtered_events=replace(self.filtered_events,metadata={**self.filtered_events.metadata,
+                'resolution':[width,height],'resolution_origin':self.events.metadata['resolution_origin']})
         self.analysis_panel.clear_analysis()
         self._update_stats_global()
         self._render_from_ui()
@@ -909,7 +942,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Session load failed", str(exc))
 
     def _update_window_title(self) -> None:
-        self.setWindowTitle(f"Event-Based Studio — {self.project_name}")
+        from .version import __version__
+        self.setWindowTitle(f"Event-Based Studio {__version__} — {self.project_name}")
 
     def _next_default_roi_color(self) -> str:
         return ROI_COLOR_PALETTE[len(self.rois) % len(ROI_COLOR_PALETTE)]
@@ -950,6 +984,10 @@ class MainWindow(QMainWindow):
         self._render_from_ui()
 
     def closeEvent(self, event) -> None:
+        if self._live_window is not None and self._live_window.worker is not None:
+            self._live_window.stop_camera()
+            event.ignore()
+            return
         if self._task is not None:
             self.statusBar().showMessage("Finish the current import/export before closing.")
             event.ignore()
@@ -1236,6 +1274,9 @@ class MainWindow(QMainWindow):
             source = Path(session.get("source", {}).get("csv_path", ""))
             def prepare(cancel, progress):
                 raw = load_events_from_csv(source)
+                if cancel():
+                    from .filters import CancelledError
+                    raise CancelledError('Session restoration cancelled; previous analysis preserved.')
                 return raw, apply_filters(raw,settings,cancel,progress)
             self._run_task(prepare,lambda result:self._restore_session(session,result),
                            "Restoring analysis dataset and filters...",cooperative=True)
@@ -1310,6 +1351,9 @@ class MainWindow(QMainWindow):
                 raise ValueError("A slice references a missing ROI without saved spatial bounds.")
             if item.get("source_sha256") and item["source_sha256"] != prepared_events.metadata.get("sha256"):
                 raise ValueError("A slice belongs to a different source recording.")
+        for item in session.get('annotations',[]) + session.get('detections',[]):
+            if item.get('source_sha256') and item['source_sha256']!=prepared_events.metadata.get('sha256'):
+                raise ValueError('An annotation or detection belongs to a different source recording.')
         if view.get("polarity", "both") not in ("both", "pos", "neg"):
             raise ValueError("Session contains an unknown polarity filter.")
 
@@ -1331,6 +1375,10 @@ class MainWindow(QMainWindow):
 
         self.events = events
         self.hw = hw
+        if self.filtered_events is not None and prepared_events is not None:
+            self.filtered_events=replace(self.filtered_events,metadata={**self.filtered_events.metadata,
+                'resolution':list(events.metadata.get('resolution',[hw[1],hw[0]])),
+                'resolution_origin':events.metadata.get('resolution_origin','unknown')})
         self.t_min = int(events.t.min()) if events.t.size else 0
         self.t_max = int(events.t.max()) if events.t.size else 0
         self.loaded_name = loaded_name
@@ -1560,7 +1608,7 @@ class MainWindow(QMainWindow):
     def _extract_window_batch(self, t0: int, t1: int):
         if self.events is None:
             return None
-        batch = select(self._display_events(), t0, t1, polarity=self.polarity_combo.currentText())
+        batch = self._window_batch(t0,t1)
         return batch if len(batch.t) else None
 
 
@@ -1675,13 +1723,7 @@ class MainWindow(QMainWindow):
         roi = roi_item.roi
         window_us = int(t1 - t0)
 
-        stats = compute_roi_stats(
-            events=select(self._display_events(), t0, t1, polarity=self.polarity_combo.currentText()),
-            hw=self.hw,
-            roi=roi,
-            t0_us=int(t0),
-            window_us=int(window_us),
-        )
+        stats = self._probe_stats(roi,t0,t1)
 
         roi_area = int(roi.w * roi.h)
         density = stats.n_events / roi_area if roi_area > 0 else 0.0
@@ -2367,6 +2409,9 @@ class MainWindow(QMainWindow):
 
         self._update_roi_status_label()
         self.statusBar().showMessage("Ready")
+        if self._workspace is not None:
+            self._workspace.clear_results()
+            self._workspace.hide()
 
 
 def main() -> None:
