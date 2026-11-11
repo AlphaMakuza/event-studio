@@ -30,17 +30,28 @@ from PySide6.QtWidgets import (
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.widgets import SpanSelector
 from .activity import activity_series, detect_bursts, frequency_spectrum
 from .motion import track_motion
 from .filters import CancelledError
 from .io_utils import export_table
 from .roi_label import Roi
 
+TAB_HELP = {
+    'Activity': 'Shows how many brightness-change events occur over time. The top graph shows activity; the bottom graph adds up the events. More activity can mean motion, flicker, or noise.',
+    'Bursts': 'Finds periods when activity stays above your chosen threshold. A burst is a busy period, not proof that a particular action happened.',
+    'Frequency': 'Looks for repeating patterns in activity. Frequency in hertz (Hz) means repeats per second; a peak may come from motion or lighting flicker.',
+    'Motion / micro-motion': 'Estimates how event patterns shift between time steps. Enable Calculate movement, then run analysis. Results are image movement estimates, not guaranteed object tracking.',
+    'Annotations': 'Browse all notes and their timeframes. Select a note to read it or go to its time. Add and edit comments below the main timeline.',
+    'Filters': 'Reduce isolated events, rapid repeats, or overactive pixels. The original recording stays unchanged; compare the filtered view with the original before trusting it.',
+    'Visual export / batch': 'Save images or videos of the view, or repeat the same measurements across several recordings. Display styling does not change the measured data.',
+}
+
 
 class AnalysisWorkspace(QWidget):
     def __init__(self, owner):
         super().__init__(owner, Qt.Window)
+        from .theme import appearance_controller
+        appearance_controller().watch_window(self)
         self.owner = owner
         self.results = None
         self.selectors = []
@@ -48,7 +59,7 @@ class AnalysisWorkspace(QWidget):
         self.resize(1280, 880)
         outer = QVBoxLayout(self)
         self.description = QLabel(
-            "DERIVED measurements • raw data remains authoritative. Select a plot interval to navigate the main viewer."
+            "Choose a tab, then Run analysis. Measurements use the selected time range; the original recording stays unchanged."
         )
         self.description.setWordWrap(True)
         outer.addWidget(self.description)
@@ -64,29 +75,40 @@ class AnalysisWorkspace(QWidget):
         self.button(form, "Use full recording", self.use_full_interval)
         self.scope = QComboBox()
         self.scope.addItems(["Whole field", "Active ROI", "All ROIs"])
-        form.addRow("Measurement scope", self.scope)
+        self.scope.setToolTip("Whole field means the whole image. ROI means a rectangle you drew in the viewer: Active ROI uses the selected rectangle; All ROIs compares every rectangle.")
+        form.addRow("Area to analyze", self.scope)
         self.bin_us = self.integer(1, 1_000_000_000, 1000)
-        form.addRow("Bin width µs", self.bin_us)
+        form.addRow("Time step (µs)", self.bin_us)
+        self.bin_us.setToolTip("Duration of each measurement step. 1,000 µs = 1 ms. Smaller steps show finer timing; larger steps smooth activity and reduce work.")
         self.threshold = self.number(0, 1e9, 100)
-        form.addRow("Burst threshold ev/ms (>)", self.threshold)
+        self.threshold.setToolTip("A time step is busy when its event rate exceeds this value. Events/ms means brightness changes per millisecond; it is not an object count.")
+        form.addRow("Busy above (events/ms)", self.threshold)
         self.min_burst = self.integer(1, 1_000_000_000, 1000)
-        form.addRow("Minimum burst µs", self.min_burst)
+        self.min_burst.setToolTip("How long activity must remain above the threshold to count as a burst. 1,000 µs = 1 ms.")
+        form.addRow("Minimum busy time (µs)", self.min_burst)
         self.normalize = QCheckBox("Compare rates per pixel")
+        self.normalize.setToolTip("Divides activity by area so large and small rectangles can be compared fairly.")
         form.addRow(self.normalize)
-        self.compute_motion = QCheckBox("Estimate motion of first selected probe")
+        self.compute_motion = QCheckBox("Calculate movement (first selected area)")
+        self.compute_motion.setToolTip("Compares event patterns between time steps to estimate horizontal and vertical movement. Enable this before running analysis to fill the Motion graphs. It takes extra processing time.")
         form.addRow(self.compute_motion)
         self.shift = self.integer(1, 1024, 8)
-        form.addRow("Maximum shift px", self.shift)
+        form.addRow("Movement search limit (px)", self.shift)
+        self.shift.setToolTip("Largest movement to search for between time steps, in image pixels. Increase it for larger shifts; a larger search is slower and can produce ambiguous matches.")
         self.min_events = self.integer(1, 1_000_000, 10)
-        form.addRow("Minimum events/window", self.min_events)
+        self.min_events.setToolTip("Require this many events in both time steps before estimating movement. Higher values reject sparse estimates.")
+        form.addRow("Events needed per step", self.min_events)
         self.quality = self.number(0, 1, 0.05, 3)
-        form.addRow("Minimum peak prominence", self.quality)
+        form.addRow("Match strictness (0–1)", self.quality)
+        self.quality.setToolTip("How strongly the best match stands out in the movement search. Higher values reject weaker estimates. This score is not a probability of correctness.")
         self.calibration = self.number(0, 1e9, 0, 6)
-        form.addRow("Physical units/pixel (0 = px)", self.calibration)
+        form.addRow("Real distance per pixel", self.calibration)
+        self.calibration.setToolTip("Only enter a value if you have calibrated the image scale. Leave 0 to measure in image pixels instead of real-world distance.")
         self.unit = QLineEdit("µm")
         form.addRow("Calibration unit", self.unit)
         self.amplification = self.number(0.1, 1000, 1)
-        form.addRow("STYLIZED plot amplification", self.amplification)
+        form.addRow("Movement display scale ×", self.amplification)
+        self.amplification.setToolTip("Enlarges the displayed movement plot to make small changes easier to see. Exported measurements keep their original scale.")
         self.run_button = self.button(form, "Run analysis", self.run_analysis)
         self.button(form, "Export measurements CSV + JSON", self.export_measurements)
         self.button(form, "Export frequency CSV + JSON", self.export_frequency)
@@ -99,10 +121,19 @@ class AnalysisWorkspace(QWidget):
         content.addWidget(scroll, 1)
         self.tabs = QTabWidget()
         content.addWidget(self.tabs, 3)
+        self.tab_help = QLabel()
+        self.tab_help.setWordWrap(True)
+        outer.insertWidget(1, self.tab_help)
         self.activity_figure, self.activity_canvas = self.plot_tab("Activity")
+        from .plot_navigation import PlotNavigation
+        self.activity_navigation = PlotNavigation(
+            self.activity_canvas, self.owner._seek_from_plot, self.save_plot_interval,
+            lambda: self.results["config"]["start_us"] if self.results else 0,
+        )
+        self.activity_canvas.setToolTip("Click to seek playback. Drag across time to save a slice.")
         self.burst_table = QTableWidget(0, 6)
         self.burst_table.setHorizontalHeaderLabels(
-            ["Probe", "Start µs", "End µs", "Duration µs", "Peak ev/ms", "Events"]
+            ["Area", "Start µs", "End µs", "Duration µs", "Peak events/ms", "Events"]
         )
         self.burst_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.burst_table.horizontalHeader().setSectionResizeMode(
@@ -125,7 +156,15 @@ class AnalysisWorkspace(QWidget):
         self.build_annotations()
         self.build_filters()
         self.build_exports()
+        self.tabs.currentChanged.connect(self.update_tab_help)
+        self.update_tab_help()
         self.restore_settings()
+        from .window_chrome import install_window_header
+        install_window_header(self)
+
+    def update_tab_help(self, *_):
+        title = self.tabs.tabText(self.tabs.currentIndex())
+        self.tab_help.setText(TAB_HELP.get(title, 'Choose settings, then Run analysis to calculate results.'))
 
     @staticmethod
     def integer(low, high, value):
@@ -169,6 +208,9 @@ class AnalysisWorkspace(QWidget):
     def use_full_interval(self):
         self.start.setText(str(self.owner.t_min))
         self.end.setText(str(self.owner.t_max + 1))
+        duration = self.owner.t_max + 1 - self.owner.t_min
+        limit = 2000 if self.compute_motion.isChecked() else 100000
+        self.bin_us.setValue(max(self.bin_us.value(), (duration + limit - 1) // limit))
 
     def configuration(self):
         t0, t1 = int(self.start.text()), int(self.end.text())
@@ -216,7 +258,8 @@ class AnalysisWorkspace(QWidget):
         self.normalize.setChecked(saved.get("normalize", False))
         self.compute_motion.setChecked(saved.get("compute_motion", False))
         self.unit.setText(saved.get("unit", "µm"))
-        self.use_current_interval()
+        self.use_full_interval()
+        self.refresh_annotations()
 
     def probes(self):
         owner = self.owner
@@ -259,6 +302,7 @@ class AnalysisWorkspace(QWidget):
 
         def calculate(cancel, progress):
             results = {
+                "resolution_hw": list(hw),
                 "config": config,
                 "probes": probes,
                 "series": [],
@@ -342,8 +386,8 @@ class AnalysisWorkspace(QWidget):
         ]
         self.owner._update_timeline_slice_regions()
         self.description.setText(
-            f"DERIVED • {len(result['series'])} probes | {config['bin_us']} µs bins | filters: {result['filters']}\n"
-            "Frequency represents event-rate periodicity, not proven physical vibration. Motion quality is a heuristic, not a probability."
+            f"Results for {len(result['series'])} area(s), measured every {config['bin_us'] / 1000:g} ms. "
+            "Original recording unchanged. Click a graph to move playback; drag to save a slice."
         )
         self.activity_figure.clear()
         rate = self.activity_figure.add_subplot(211)
@@ -357,12 +401,13 @@ class AnalysisWorkspace(QWidget):
             )
             denominator = area if config["normalize"] else 1
             boundaries = np.r_[relative, (series.end_us[-1] - origin) / 1000]
-            rate.stairs(series.rate / denominator, boundaries, label=probe["name"])
+            rate.stairs(series.rate / denominator, boundaries, label=probe["name"], color=probe["color"])
             cumulative.step(
                 np.r_[0, (series.end_us - origin) / 1000],
                 np.r_[0, series.cumulative],
                 where="post",
                 label=probe["name"],
+                color=probe["color"],
             )
         first = result["series"][0]
         relative = (first.start_us - origin) / 1000
@@ -380,13 +425,13 @@ class AnalysisWorkspace(QWidget):
             first.positive / duration_ms / divisor,
             boundaries,
             alpha=0.5,
-            label="First probe +",
+            label="First area: brightness increases",
         )
         rate.stairs(
             first.negative / duration_ms / divisor,
             boundaries,
             alpha=0.5,
-            label="First probe −",
+            label="First area: brightness decreases",
         )
         rate.set_ylabel("events/ms/pixel" if config["normalize"] else "events/ms")
         rate.legend(fontsize=8)
@@ -394,16 +439,7 @@ class AnalysisWorkspace(QWidget):
         cumulative.set_ylabel("Cumulative events")
         cumulative.set_xlabel("Time since interval start (ms)")
         cumulative.grid(alpha=0.2)
-        self.selectors = [
-            SpanSelector(
-                rate,
-                self.select_interval,
-                "horizontal",
-                useblit=False,
-                props={"alpha": 0.2, "facecolor": "orange"},
-                interactive=True,
-            )
-        ]
+        self.selectors = []
         self.activity_canvas.draw_idle()
         self.burst_table.setRowCount(len(result["bursts"]))
         for i, burst in enumerate(result["bursts"]):
@@ -510,7 +546,7 @@ class AnalysisWorkspace(QWidget):
             axis.text(
                 0.5,
                 0.5,
-                "Enable motion estimation and run analysis.",
+                "Check Calculate movement on the left, then click Run analysis.\nThis estimates how event patterns move between time steps.",
                 ha="center",
                 transform=axis.transAxes,
             )
@@ -530,6 +566,20 @@ class AnalysisWorkspace(QWidget):
             self.start.setText(str(start))
             self.end.setText(str(end))
 
+    def save_plot_interval(self, start, end):
+        if not self.results:
+            return
+        result = self.results
+        probes = result["probes"]
+        # A comparison span is temporal; a single-probe plot also captures its ROI.
+        probe = probes[0] if len(probes) == 1 else None
+        self.owner._slice_from_plot(start, end, {
+            "source_sha256": result["source"].get("sha256"),
+            "polarity": result["config"]["polarity"], "filters": result["filters"],
+            "roi_id": probe["id"] if probe else None,
+            "roi_snapshot": probe["roi"] if probe else None,
+        })
+
     def navigate_burst(self):
         row = self.burst_table.currentRow()
         if self.results and 0 <= row < len(self.results["bursts"]):
@@ -544,6 +594,7 @@ class AnalysisWorkspace(QWidget):
         from .app import Slice
 
         item = self.results["bursts"][row]
+        before = self.owner.edit_history.snapshot()
         probe = item["probe"]
         index = next(
             (i for i, p in enumerate(self.owner.rois) if p.id == probe["id"]), None
@@ -564,6 +615,7 @@ class AnalysisWorkspace(QWidget):
         self.owner._rebuild_slice_list()
         self.owner.slice_list.setCurrentRow(len(self.owner.slices) - 1)
         self.owner._update_timeline_slice_regions()
+        self.owner.edit_history.commit("Add burst slice", before)
 
     def save_measurement(self, title, columns, rows, metadata):
         path, _ = QFileDialog.getSaveFileName(
@@ -598,6 +650,8 @@ class AnalysisWorkspace(QWidget):
                 int(pos),
                 int(neg),
                 float(rate),
+                float(rate) / (probe["roi"]["w"] * probe["roi"]["h"] if probe["roi"]
+                               else result["resolution_hw"][0] * result["resolution_hw"][1]),
                 int(cumulative),
             )
             for probe, series in zip(result["probes"], result["series"])
@@ -622,6 +676,7 @@ class AnalysisWorkspace(QWidget):
                 "positive",
                 "negative",
                 "events_per_ms",
+                "events_per_ms_per_pixel",
                 "cumulative_events",
             ],
             rows,
@@ -631,7 +686,7 @@ class AnalysisWorkspace(QWidget):
                 "parameters": result["config"],
                 "probes": result["probes"],
                 "filters": result["filters"],
-                "rate_normalization": "CSV rates are absolute events/ms; graph per-pixel normalization is presentation only",
+                "rate_normalization": "CSV includes absolute events/ms and events/ms/pixel; graph normalization uses the same ROI area.",
             },
         )
 
@@ -752,105 +807,68 @@ class AnalysisWorkspace(QWidget):
 
     def build_annotations(self):
         page = QWidget()
+        page.setStyleSheet('QLabel, QListWidget, QPlainTextEdit { color: #d9d9df; selection-color: #ffffff; } QPlainTextEdit { placeholder-text-color: #b6b6c2; }')
         layout = QVBoxLayout(page)
+        hint = QLabel("All project notes, with times measured from the recording start. Add and edit notes below the main timeline. Double-click a note to go to its time.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         self.notes = QListWidget()
+        self.notes.setAccessibleName("All timeline notes")
         layout.addWidget(self.notes)
-        self.note_name = QLineEdit()
-        self.note_name.setPlaceholderText("Annotation name")
-        layout.addWidget(self.note_name)
-        self.note_tags = QLineEdit()
-        self.note_tags.setPlaceholderText("Comma-separated labels")
-        layout.addWidget(self.note_tags)
-        self.note_text = QPlainTextEdit()
-        self.note_text.setPlaceholderText("Research notes (separate from raw events)")
-        layout.addWidget(self.note_text)
-        self.note_interval = QCheckBox(
-            "Save current main-view interval (unchecked = timestamp marker)"
-        )
-        layout.addWidget(self.note_interval)
+        self.note_detail = QPlainTextEdit()
+        self.note_detail.setReadOnly(True)
+        self.note_detail.setPlaceholderText("Select a note to read it.")
+        layout.addWidget(self.note_detail)
         for label, handler in (
-            ("Add annotation", self.add_annotation),
-            ("Update selected text / labels", self.update_annotation),
-            ("Jump to annotation", self.jump_annotation),
-            ("Delete selected annotation", self.delete_annotation),
-            ("Export annotations CSV + JSON", self.export_annotations),
+            ("Go to annotated time", self.jump_annotation),
+            ("Export notes CSV + JSON", self.export_annotations),
         ):
             button = QPushButton(label)
             button.clicked.connect(handler)
             layout.addWidget(button)
         self.notes.currentRowChanged.connect(self.select_annotation)
+        self.notes.itemDoubleClicked.connect(lambda _: self.jump_annotation())
         self.tabs.addTab(page, "Annotations")
 
     def refresh_annotations(self):
         if not hasattr(self, "notes"):
             return
+        from .timeline_notes import note_time
+        selected = self.notes.currentItem()
+        selected_index = selected.data(Qt.UserRole) if selected is not None else None
         self.notes.blockSignals(True)
         self.notes.clear()
-        for note in self.owner.annotations:
-            self.notes.addItem(
-                f"{note['name']} | [{note['t0']}, {note['t1']}] µs | {', '.join(note.get('labels',[]))}"
-            )
+        for index, note in sorted(enumerate(self.owner.annotations), key=lambda pair: pair[1]['t0']):
+            from PySide6.QtWidgets import QListWidgetItem
+            text = note.get('text') or note.get('name', 'Note')
+            item = QListWidgetItem(f"{note_time(note, self.owner.t_min)}  |  {text.replace(chr(10), ' ')}")
+            item.setData(Qt.UserRole, index)
+            item.setToolTip(text)
+            self.notes.addItem(item)
+            if index == selected_index:
+                self.notes.setCurrentItem(item)
         self.notes.blockSignals(False)
+        self.select_annotation(self.notes.currentRow())
+        if not self.owner.annotations:
+            self.note_detail.setPlainText("No notes yet. Add a comment below the main timeline.")
 
-    def add_annotation(self):
-        owner = self.owner
-        start, end = owner._current_window()
-        end = end if self.note_interval.isChecked() else start
-        probe = (
-            owner.rois[owner.active_roi_index]
-            if owner.active_roi_index is not None
-            else None
-        )
-        owner.annotations.append(
-            {
-                "id": uuid4().hex,
-                "name": self.note_name.text().strip() or "Annotation",
-                "t0": start,
-                "t1": end,
-                "text": self.note_text.toPlainText(),
-                "labels": [
-                    t.strip() for t in self.note_tags.text().split(",") if t.strip()
-                ],
-                "roi_id": probe.id if probe else None,
-                "roi_snapshot": vars(probe.roi).copy() if probe else None,
-                "source_sha256": owner.events.metadata.get("sha256"),
-            }
-        )
-        self.refresh_annotations()
-        owner._update_timeline_slice_regions()
+    def selected_annotation_index(self):
+        item = self.notes.currentItem()
+        return item.data(Qt.UserRole) if item is not None else -1
 
     def select_annotation(self, row):
-        if 0 <= row < len(self.owner.annotations):
-            note = self.owner.annotations[row]
-            self.note_name.setText(note["name"])
-            self.note_tags.setText(", ".join(note.get("labels", [])))
-            self.note_text.setPlainText(note.get("text", ""))
-
-    def update_annotation(self):
-        row = self.notes.currentRow()
-        if 0 <= row < len(self.owner.annotations):
-            self.owner.annotations[row].update(
-                name=self.note_name.text().strip() or "Annotation",
-                text=self.note_text.toPlainText(),
-                labels=[
-                    v.strip() for v in self.note_tags.text().split(",") if v.strip()
-                ],
-            )
-            self.refresh_annotations()
+        index = self.selected_annotation_index()
+        if 0 <= index < len(self.owner.annotations):
+            from .timeline_notes import note_time
+            note = self.owner.annotations[index]
+            self.note_detail.setPlainText(f"{note_time(note, self.owner.t_min)}\n\n{note.get('text') or note.get('name', '')}")
+        else:
+            self.note_detail.clear()
 
     def jump_annotation(self):
-        row = self.notes.currentRow()
-        if 0 <= row < len(self.owner.annotations):
-            note = self.owner.annotations[row]
-            self.owner.duration_us = max(1, note["t1"] - note["t0"])
-            self.owner._seek(note["t0"])
-
-    def delete_annotation(self):
-        row = self.notes.currentRow()
-        if 0 <= row < len(self.owner.annotations):
-            del self.owner.annotations[row]
-            self.refresh_annotations()
-            self.owner._update_timeline_slice_regions()
+        index = self.selected_annotation_index()
+        if 0 <= index < len(self.owner.annotations):
+            self.owner.timeline_notes.select_note(index)
 
     def export_annotations(self):
         notes = [note.copy() for note in self.owner.annotations]
@@ -942,6 +960,12 @@ class AnalysisWorkspace(QWidget):
         )
         form.addRow(self.batch_rois)
         self.button(form, "Batch analyze CSV recordings", self.run_batch)
+        self.batch_results = QTableWidget(0, 6)
+        self.batch_results.setHorizontalHeaderLabels(
+            ["Recording", "ROI", "Status", "Events", "Events/ms/pixel", "Error"]
+        )
+        self.batch_results.setEditTriggers(QTableWidget.NoEditTriggers)
+        form.addRow(self.batch_results)
         self.tabs.addTab(page, "Visual export / batch")
 
     def export_visual(self):
@@ -1017,6 +1041,8 @@ class AnalysisWorkspace(QWidget):
         options = {
             "bin_us": self.bin_us.value(),
             "threshold": self.threshold.value(),
+            "min_burst_us": self.min_burst.value(),
+            "polarity": self.owner.polarity_combo.currentText(),
             "filters": self.owner.filter_settings.copy(),
             "rois": (
                 [{"name": p.name, "roi": vars(p.roi).copy()} for p in self.owner.rois]
@@ -1030,12 +1056,25 @@ class AnalysisWorkspace(QWidget):
             lambda cancel, progress: analyze_batch(
                 paths, destination, cancelled=cancel, progress=progress, **options
             ),
-            lambda report: self.description.setText(
-                f"Batch finished: {sum(r['status']=='ok' for r in report['results'])} results; {sum(r['status']=='error' for r in report['results'])} errors. Details: {destination}"
-            ),
+            lambda report: self.show_batch_results(report, destination),
             "Running batch analysis…",
             cooperative=True,
         )
+
+    def show_batch_results(self, report, destination):
+        rows = report["results"]
+        self.description.setText(
+            f"Batch {'cancelled' if report['cancelled'] else 'finished'}: "
+            f"{sum(r['status']=='ok' for r in rows)} results; "
+            f"{sum(r['status']=='error' for r in rows)} errors. CSV / JSON: {destination}"
+        )
+        self.batch_results.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            values = (Path(row["source"]).name, row.get("probe", ""), row["status"],
+                      row.get("events", ""), row.get("events_per_ms_per_pixel", ""), row.get("error", ""))
+            for j, value in enumerate(values):
+                self.batch_results.setItem(i, j, QTableWidgetItem(str(value)))
+        self.batch_results.resizeColumnsToContents()
 
     def clear_results(self):
         self.results = None

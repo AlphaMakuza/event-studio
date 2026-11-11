@@ -1,0 +1,24 @@
+{
+  "accessed": "2026-11-10",
+  "photos": [
+    {
+      "name": "event-camera-output",
+      "creator": "TimoStoffregen",
+      "page": "https://commons.wikimedia.org/wiki/File:Event_camera_comparison.jpg",
+      "license": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "download": "https://upload.wikimedia.org/wikipedia/commons/2/26/Event_camera_comparison.jpg",
+      "edits": "None. Original 1500 x 568 image displayed without cropping.",
+      "sha256": "96db91f75473277a6078edd438b4dc83aa29942a516f817f0df8d251547885dd"
+    },
+    {
+      "name": "manufacturing",
+      "id": "18631424",
+      "creator": "Vladimir Srajber",
+      "page": "https://www.pexels.com/photo/bottles-of-water-in-factory-18631424/",
+      "license": "https://www.pexels.com/license/",
+      "edits": "Pexels image service crop to 1597 x 949.",
+      "download": "https://images.pexels.com/photos/18631424/pexels-photo-18631424.jpeg?auto=compress&cs=tinysrgb&w=1597&h=949&fit=crop&q=90",
+      "sha256": "c8850d44222e0d126778cb6ed0ca0e5739ced921ea7bffa3ad7775d650fd5e42"
+    }
+  ]
+}

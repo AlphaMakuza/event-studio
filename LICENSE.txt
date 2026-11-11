@@ -1,0 +1,55 @@
+Event-Based Studio - Proprietary Software License
+Copyright (c) 2026 Alpha Makuza. All rights reserved.
+
+1. Permission to use
+Alpha Makuza grants you a non-exclusive, non-transferable permission to install
+and use an authorized copy of Event-Based Studio for personal, educational,
+research, or internal business purposes. You may make backup copies for your
+own use. This license does not transfer ownership of the software or grant
+rights to its source code. No payment or subscription obligation is created
+by these terms.
+
+2. Restrictions
+Except as permitted by applicable law or the third-party terms described below,
+you may not redistribute, sublicense, sell, rent, publish, or modify the
+application, create derivative works of it, or reverse engineer, decompile,
+or disassemble it without Alpha Makuza's written permission. Do not remove
+copyright or license notices. Direct others to the author's authorized
+download location instead of sharing copies of the application.
+
+3. Your recordings and results
+You retain your rights in recordings, projects, annotations, and results you
+create or process with the software. This license does not restrict sharing
+your own exported data or project bundles. You are responsible for having
+permission to use and share any third-party data they contain.
+
+4. Third-party software takes precedence
+The application includes separately licensed third-party components. Those
+components remain governed by their own licenses, not the restrictions above.
+Nothing in these terms limits any right granted by those licenses, including
+rights to obtain corresponding source code, copy, modify, redistribute,
+replace or relink a library, or reverse engineer the combined work to debug
+modifications to an LGPL-covered library. You may modify the combined work
+for your own use to the extent required by those licenses. See the included
+THIRD-PARTY.md and third-party license texts. No commercial Qt license is
+granted by this application license.
+
+5. No warranty
+To the extent permitted by applicable law, the software is provided "as is"
+without warranties, including warranties of merchantability, fitness for a
+particular purpose, accuracy, or non-infringement. Development previews may
+contain defects. Keep backups and independently validate scientific results.
+No promise of support, updates, or continued availability is made.
+
+6. Liability
+To the extent permitted by applicable law, Alpha Makuza is not liable for loss
+of data, profits, business, or other indirect, incidental, consequential, or
+special damages arising from use of the software. Nothing in these terms
+excludes liability or mandatory consumer rights that cannot lawfully be excluded.
+
+7. Termination
+Permission under this license ends if you materially breach its terms. You
+must then stop using and remove your copies of the proprietary application.
+Your rights in your data and separately licensed third-party components remain
+unaffected. Any permission to use a later version is subject to its own terms;
+later terms do not retroactively change this license for the version you received.

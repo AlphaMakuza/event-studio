@@ -1,0 +1,58 @@
+safe:             false
+port:             7998
+baseurl:          /elusive-icons/  # Where GitHub serves the project up from
+url:              http://127.0.0.1:7998
+
+source:           src
+destination:      _gh_pages
+plugins:          src/_plugins
+
+pygments:         true
+permalink:        pretty
+
+# ensures SCSS files are compiled
+include:          [_*.scss]
+
+# used in building icon pages
+icon_meta:        src/icons.yml
+icon_layout:      icon.html    # Relative to _layouts directory
+icon_destination: icon         # Relative to destination
+
+elusiveicons:
+  version:        2.0.0
+  minor_version:  2.0
+  doc_blob:       v2.0.0
+  url:            http://elusiveicons.com
+  legacy_url:     http://reduxframework.github.com/Elusive-Icons/
+  blog_url:       http://reduxframework.com/about/newswire/
+  twitter:        reduxframework
+  tagline:        The iconic font and CSS toolkit
+  primary_icon:   el-redux
+  css_prefix:     el
+  author:
+    name:         Team Redux
+    email:        elusive@redux.io
+    twitter:      ReduxFramework
+    github:       reduxframework
+    url:          http://reduxframework.com/
+  github:
+    url:          https://github.com/reduxframework/Elusive-Icons
+    project:      elusive-icons
+    org:          reduxframework
+  license:
+    font:
+      version:      SIL OFL 1.1
+      url:          http://scripts.sil.org/OFL
+    code:
+      version:      MIT License
+      url:          http://opensource.org/licenses/mit-license.html
+    documentation:
+      version:      CC BY 3.0
+      url:          http://creativecommons.org/licenses/by/3.0/
+
+bootstrap:
+  version:        3.2.0
+  url:            http://getbootstrap.com
+
+jquery:
+  version:        1.11.1

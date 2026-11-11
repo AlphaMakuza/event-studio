@@ -1,0 +1,18 @@
+{
+  "version": "2.0.0rc1",
+  "publisher": "Alpha Makuza",
+  "support_contact": "https://event-based-studio-alpha-makuza.luxedance1.chatgpt.site/#support",
+  "require_signature": false,
+  "release_stage": "candidate",
+  "clean_windows_report": null,
+  "source_companion": "artifacts/Event-Based-Studio-Qt-6.10.1-corresponding-source.zip",
+  "public_release_checks_complete": false,
+  "staging": {
+    "project_id": "appgprj_6af37401cd2c8191ac676c3416b2f24d",
+    "version_id": "appgprj_6af37401cd2c8191ac676c3416b2f24d~appgver_1b150024cafc81918381ab50d0a8baf7",
+    "deployment_id": "appgdep_6af37a33c3848191b79131c0ee27a2b4",
+    "commit_sha": "6c6a65fd87b7590d7a57f7bc97f2c26c5debea7d",
+    "status": "succeeded",
+    "url": "https://event-based-studio-alpha-makuza.luxedance1.chatgpt.site"
+  }
+}

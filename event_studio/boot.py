@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable, Optional
 import wave
 from PySide6.QtCore import Qt, QTimer, QRect, QUrl
-from PySide6.QtGui import QPixmap, QBitmap, QRegion
+from PySide6.QtGui import QPixmap, QBitmap, QRegion, QFontDatabase
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -38,16 +38,19 @@ class BootOverlay(QWidget):
         self.logo.setPixmap(
             pixmap.scaled(420, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
-        self.status = QLabel(self)
-        self.status.setAlignment(Qt.AlignCenter)
-        loading = QPixmap(str(_asset_path("loading.png")))
-        if loading.isNull():
-            self.status.setText("L O A D I N G . . .")
-            self.status.setStyleSheet(
-                "color: white; font: 12px Consolas; background: transparent;"
+        self.step_label = QLabel(self)
+        self.step_label.setAlignment(Qt.AlignCenter)
+        console_font = Path("C:/Windows/Fonts/consola.ttf")
+        if console_font.exists():
+            QFontDatabase.addApplicationFont(str(console_font))
+        for label in (self.step_label,):
+            label.setStyleSheet(
+                "color: white; font: 8px Consolas, monospace; background: transparent;"
             )
-        else:
-            self.status.setPixmap(loading)
+            label.setTextFormat(Qt.PlainText)
+        self.completed_steps = []
+        self._tasks_done = False
+        self._audio_done = False
         self.set_message(message)
         # Short PCM sound avoids the native media pipeline's early-stop stall.
         self.player = QSoundEffect(self)
@@ -56,9 +59,9 @@ class BootOverlay(QWidget):
         self.wav_path = _asset_path("boot.wav")
         if self.wav_path.exists():
             self.player.setSource(QUrl.fromLocalFile(str(self.wav_path)))
-        self.setFixedSize(480, 280)
-        self.logo.setGeometry(QRect(0, 20, 480, 200))
-        self.status.setGeometry(QRect(0, 235, 480, 20))
+        self.setFixedSize(540, 390)
+        self.logo.setGeometry(QRect(0, 20, 540, 200))
+        self.step_label.setGeometry(QRect(0, 303, 540, 12))
         self.finished = False
         self._audio_started = False
         self._fallback = QTimer(self)
@@ -81,8 +84,8 @@ class BootOverlay(QWidget):
             self.player.play()
 
     def set_message(self, text):
-        self.status.setAccessibleName(text)
-        self.status.setToolTip(text)
+        self.step_label.setAccessibleName(text)
+        self.step_label.setText(text)
 
 
 def show_boot(
@@ -92,6 +95,8 @@ def show_boot(
     message="Loading Event-Based Studio…",
     keep_music: bool = False,
     on_done: Optional[Callable[[], None]] = None,
+    steps=(),
+    on_error=None,
 ):
     """Reveal the homepage after the song; fall back safely if audio cannot play.
 
@@ -99,9 +104,11 @@ def show_boot(
     keep_music remains accepted for callers of the previous API.
     """
     overlay = BootOverlay(message)
+    pending = list(steps)
+    overlay._tasks_done = not pending
 
     def finish():
-        if overlay.finished:
+        if overlay.finished or not (overlay._tasks_done and overlay._audio_done):
             return
         overlay.finished = True
         overlay._fallback.stop()
@@ -112,11 +119,44 @@ def show_boot(
         overlay.hide()
         overlay.deleteLater()
 
+    def audio_done():
+        overlay._audio_done = True
+        finish()
+
+    def next_step():
+        if not pending:
+            overlay._tasks_done = True
+            overlay.set_message(
+                "Finishing up…"
+                if not overlay._audio_done
+                else "Ready"
+            )
+            finish()
+            return
+        label, action = pending.pop(0)
+        overlay.set_message(label + "…")
+
+        def execute():
+            try:
+                action()
+            except Exception as exc:
+                overlay._fallback.stop()
+                overlay.player.stop()
+                overlay.set_message("Startup failed: " + str(exc))
+                if on_error:
+                    on_error(exc)
+                return
+            overlay.completed_steps.append(label)
+            # Keep each real status readable before replacing it with the next.
+            QTimer.singleShot(400, next_step)
+
+        QTimer.singleShot(0, execute)
+
     def playing_changed():
         if overlay.player.isPlaying():
             overlay._audio_started = True
         elif overlay._audio_started:
-            finish()
+            audio_done()
 
     def status_changed():
         if overlay.player.status() == QSoundEffect.Error:
@@ -124,7 +164,7 @@ def show_boot(
 
     overlay.player.playingChanged.connect(playing_changed)
     overlay.player.statusChanged.connect(status_changed)
-    overlay._fallback.timeout.connect(finish)
+    overlay._fallback.timeout.connect(audio_done)
     try:
         with wave.open(str(overlay.wav_path), "rb") as sound:
             duration_ms = int(1000 * sound.getnframes() / sound.getframerate())
@@ -133,6 +173,8 @@ def show_boot(
         fallback = max(ms, 1000)
     overlay._fallback.start(fallback)
     overlay.start()
+    if pending:
+        QTimer.singleShot(0, next_step)
     # Some backends synchronously reject an unavailable audio device.
     if overlay.player.status() == QSoundEffect.Error:
         status_changed()

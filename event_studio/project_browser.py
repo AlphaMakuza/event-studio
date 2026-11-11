@@ -2,21 +2,33 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import shutil
 from typing import Callable
-from PySide6.QtCore import Qt, QTimer, Signal, QSettings
-from PySide6.QtGui import QPixmap
+from .glass_surface import GlassSurface
+from .theme import appearance_controller, BROWSER_STYLESHEET, StudioMenu as QMenu
+from . import classic_theme
+from .ui_icons import icon
+from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QSize
+from PySide6.QtGui import QPixmap, QIcon, QPainter, QColor, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
+    QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
+    QProgressDialog,
     QScrollArea,
     QSizePolicy,
+    QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
     QVBoxLayout,
     QWidget,
 )
@@ -24,8 +36,51 @@ from .project_utils import (
     create_project_dir,
     list_projects,
     rename_project,
+    rename_project_folder,
     sanitize_project_name,
 )
+
+
+class ViewComboBox(QComboBox):
+    """Keep a stable menu title while the popup contains view glyphs."""
+
+    def paintEvent(self, event):
+        painter = QStylePainter(self)
+        try:
+            option = QStyleOptionComboBox()
+            self.initStyleOption(option)
+            option.currentText = "View"
+            # QComboBox exposes itemIcon(index), not currentIcon(). An error
+            # in this native paint callback must never leave its painter active.
+            option.currentIcon = (
+                self.itemIcon(self.currentIndex())
+                if appearance_controller().mode == "glass" else QIcon()
+            )
+            painter.drawComplexControl(QStyle.CC_ComboBox, option)
+            painter.drawControl(QStyle.CE_ComboBoxLabel, option)
+        finally:
+            painter.end()
+
+
+def view_icon(mode):
+    """Small, consistent view glyphs that do not depend on installed fonts."""
+    pixmap = QPixmap(20, 20)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setPen(QPen(QColor("#e2dfe7"), 1.4))
+    if mode == "cards":
+        for x in (3, 12):
+            for y in (3, 12):
+                painter.drawRect(x, y, 5, 5)
+    else:
+        for y in (4, 10, 16):
+            if mode == "rows":
+                painter.drawRect(2, y - 2, 4, 4)
+                painter.drawLine(9, y, 18, y)
+            else:
+                painter.drawLine(3, y, 18, y)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def saved_date(value):
@@ -37,6 +92,8 @@ def saved_date(value):
 
 class ProjectTile(QFrame):
     openRequested = Signal(str)
+    deleteRequested = Signal(str)
+    renameRequested = Signal(str)
 
     def __init__(self, project_info, parent=None, *, view="cards"):
         super().__init__(parent)
@@ -86,16 +143,38 @@ class ProjectTile(QFrame):
         self.saved_label = QLabel(saved_date(project_info.get("last_saved_at", "")))
         self.saved_label.setObjectName("Muted")
         self.saved_label.setToolTip("Last saved")
-        root.addWidget(self.saved_label)
-        if view != "cards":
-            self.open_btn = QPushButton("Open")
-            self.open_btn.setAccessibleName(f"Open {name}")
-            self.open_btn.clicked.connect(self._emit_open)
-            root.addWidget(self.open_btn)
+        self.menu_btn = QPushButton("...")
+        self.menu_btn.setObjectName("ProjectMenu")
+        self.menu_btn.setFixedWidth(36)
+        self.menu_btn.setAccessibleName(f"Actions for {name}")
+        self.menu_btn.setToolTip("Project actions")
+        self.menu_btn.clicked.connect(
+            lambda: self._show_project_menu(self.menu_btn.mapToGlobal(self.menu_btn.rect().bottomLeft()))
+        )
+        if view == "cards":
+            footer = QHBoxLayout()
+            footer.addWidget(self.saved_label, 1)
+            footer.addWidget(self.menu_btn)
+            root.addLayout(footer)
+        else:
+            root.addWidget(self.saved_label)
+            root.addWidget(self.menu_btn)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda pos: self._show_project_menu(self.mapToGlobal(pos))
+        )
         self.preview_timer = QTimer(self)
         self.preview_timer.setInterval(120)
         self.preview_timer.timeout.connect(self._advance_preview)
         self._set_initial_image()
+
+        appearance_controller().changed.connect(self._apply_appearance)
+        self._apply_appearance()
+
+    def _apply_appearance(self, *_):
+        glass = appearance_controller().mode == "glass"
+        self.menu_btn.setText("" if glass else "...")
+        self.menu_btn.setIcon(icon("dots-three") if glass else QIcon())
 
     def _show_image(self, path):
         pixmap = QPixmap(str(path)) if path else QPixmap()
@@ -121,6 +200,15 @@ class ProjectTile(QFrame):
 
     def _emit_open(self):
         self.openRequested.emit(self.project_dir)
+
+    def _show_project_menu(self, position):
+        menu = QMenu(self)
+        menu.addAction("Open project", self._emit_open)
+        menu.addAction("Rename project", lambda: self.renameRequested.emit(self.project_dir))
+        menu.addSeparator()
+        menu.addAction("Delete project", lambda: self.deleteRequested.emit(self.project_dir))
+        menu.exec(position)
+        menu.deleteLater()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -157,6 +245,7 @@ class ProjectBrowser(QMainWindow):
         open_project_callback: Callable[[str], None],
         *,
         settings=None,
+        autoload=True,
     ):
         super().__init__()
         self.projects_root = Path(projects_root)
@@ -167,35 +256,13 @@ class ProjectBrowser(QMainWindow):
             else QSettings("EventBasedStudio", "ProjectBrowser")
         )
         self.projects = []
+        self._transfer_task = None
         self._columns = 0
         self.setWindowTitle("Event-Based Studio — Projects")
         self.resize(1180, 760)
         self.setMinimumSize(760, 500)
-        self.setStyleSheet("""
-            QMainWindow, QWidget#Browser { background: #232323; color: #dedede; }
-            QFrame#Sidebar { background: #1c1c1c; border-right: 1px solid #393939; }
-            QLabel { background: transparent; color: #dedede; }
-            QLabel#Brand { font-size: 21px; font-weight: 600; }
-            QLabel#Eyebrow { color: #d69a56; font-size: 10px; }
-            QLabel#Heading { font-size: 24px; font-weight: 600; }
-            QLabel#Muted { color: #999999; font-size: 11px; }
-            QLabel#ProjectTitle { font-size: 14px; font-weight: 600; }
-            QLabel#ProjectPreview { background: #151515; color: #666666; font-size: 10px; }
-            QPushButton { background: #303030; color: #dddddd; border: 1px solid #444444;
-                          border-radius: 4px; padding: 8px 12px; text-align: left; }
-            QPushButton:hover { background: #3b3b3b; border-color: #777777; }
-            QPushButton#Primary { background: #d49b57; border-color: #d49b57; color: #171717; font-weight: 600; }
-            QPushButton#Selected { background: #32302b; border-color: #65523a; color: #e6b477; }
-            QLineEdit, QComboBox { background: #303030; color: #dddddd; border: 1px solid #464646;
-                                 border-radius: 4px; padding: 7px 9px; }
-            QLineEdit:focus, QComboBox:focus { border-color: #d49b57; }
-            QComboBox QAbstractItemView { background: #303030; color: #eeeeee; selection-background-color: #665033; }
-            QScrollArea, QWidget#ProjectHost { background: #232323; border: none; }
-            QFrame#ProjectTile { background: #292929; border: 1px solid #3b3b3b; border-radius: 5px; }
-            QFrame#ProjectTile:hover { background: #303030; border-color: #b68a52; }
-            QFrame#ProjectTile:focus { border-color: #e6b477; }
-        """)
-        central = QWidget()
+        self._apply_appearance()
+        central = GlassSurface()
         central.setObjectName("Browser")
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -224,6 +291,10 @@ class ProjectBrowser(QMainWindow):
         version = QLabel(__version__)
         version.setObjectName("Muted")
         brand.addWidget(version)
+        from .about import show_about
+        about = QPushButton("About")
+        about.clicked.connect(lambda: show_about(self))
+        brand.addWidget(about)
         root.addLayout(brand)
         body = QHBoxLayout()
         body.setSpacing(0)
@@ -248,10 +319,11 @@ class ProjectBrowser(QMainWindow):
         self.btn_live = QPushButton("Live Camera")
         self.btn_live.clicked.connect(self._open_live_camera)
         nav.addWidget(self.btn_live)
+        self.btn_import = QPushButton("Import project")
+        self.btn_import.setToolTip("Import an Event-Based Studio project (.ebs)")
+        self.btn_import.clicked.connect(self._import_project_bundle)
+        nav.addWidget(self.btn_import)
         nav.addStretch()
-        caption = QLabel("Your recordings.\nYour workspace.")
-        caption.setObjectName("Muted")
-        nav.addWidget(caption)
         body.addWidget(sidebar)
         content = QVBoxLayout()
         content.setContentsMargins(24, 22, 24, 12)
@@ -266,23 +338,30 @@ class ProjectBrowser(QMainWindow):
         self.search.setPlaceholderText("Search projects or datasets…")
         self.search.setClearButtonEnabled(True)
         self.search.setAccessibleName("Search projects")
+        self.search_action = self.search.addAction(icon("magnifying-glass"), QLineEdit.LeadingPosition)
         toolbar.addWidget(self.search, 1)
         self.sort_combo = QComboBox()
         self.sort_combo.addItem("Recently saved", "recent")
         self.sort_combo.addItem("Name A–Z", "name")
         self.sort_combo.setAccessibleName("Sort projects")
         toolbar.addWidget(self.sort_combo)
-        self.view_combo = QComboBox()
+        self.view_combo = ViewComboBox()
         for text, value in [
             ("Image + text", "rows"),
             ("Text only", "text"),
             ("Large tiles", "cards"),
         ]:
-            self.view_combo.addItem(text, value)
+            self.view_combo.addItem(view_icon(value), "", value)
+            index = self.view_combo.count() - 1
+            self.view_combo.setItemData(index, text, Qt.ToolTipRole)
+            self.view_combo.setItemData(index, text, Qt.AccessibleTextRole)
+        self.view_combo.setIconSize(QSize(20, 20))
+        self.view_combo.setFixedWidth(80)
         self.view_combo.setAccessibleName("Project view")
         self.view_combo.setCurrentIndex(
             max(0, self.view_combo.findData(self.settings.value("view", "rows")))
         )
+        self.view_combo.setToolTip(self.view_combo.currentData(Qt.ToolTipRole))
         toolbar.addWidget(self.view_combo)
         self.btn_refresh = QPushButton("Refresh")
         self.btn_refresh.clicked.connect(self.refresh_projects)
@@ -308,7 +387,29 @@ class ProjectBrowser(QMainWindow):
         self.search.textChanged.connect(self._render_projects)
         self.sort_combo.currentIndexChanged.connect(self._render_projects)
         self.view_combo.currentIndexChanged.connect(self._view_changed)
-        self.refresh_projects()
+        from .window_chrome import StudioHeader
+        self.studio_header = StudioHeader(self, show_appearance=True)
+        self.setMenuWidget(self.studio_header)
+        appearance_controller().changed.connect(self._apply_appearance)
+        self._apply_appearance()
+        if autoload:
+            self.refresh_projects()
+        else:
+            self._render_projects()
+
+    def _apply_appearance(self, *_):
+        glass = appearance_controller().mode == "glass"
+        self.setStyleSheet(BROWSER_STYLESHEET if glass else classic_theme.BROWSER_STYLESHEET)
+        if hasattr(self, "btn_new"):
+            self.btn_new.setText("New project" if glass else "+  New project")
+            self.search_action.setVisible(glass)
+            self.view_combo.setFixedWidth(104 if glass else 80)
+            for index in range(self.view_combo.count()):
+                mode = self.view_combo.itemData(index)
+                glyph = {"cards": "squares-four", "rows": "rows", "text": "list"}[mode]
+                self.view_combo.setItemIcon(index, icon(glyph) if glass else view_icon(mode))
+            self.btn_new.update()
+        self.update()
 
     def _reset_filters(self):
         self.search.clear()
@@ -330,11 +431,52 @@ class ProjectBrowser(QMainWindow):
 
         self._live_window = show_live_camera()
 
+    def _import_project_bundle(self):
+        if self._transfer_task is not None:
+            return
+        from .project_transfer import IMPORT_FILTER, import_project
+        from .workers import Task
+        path, _ = QFileDialog.getOpenFileName(self, "Import project", str(Path.home()), IMPORT_FILTER)
+        if not path:
+            return
+        progress = QProgressDialog("Checking and importing project…", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Import project")
+        progress.setAutoClose(False)
+        progress.setMinimumDuration(200)
+        task = Task(lambda: import_project(path, self.projects_root,
+            cancel=task.isInterruptionRequested, progress=task.progress.emit), self)
+        self._transfer_task = task
+        self.centralWidget().setEnabled(False)
+        progress.canceled.connect(task.requestInterruption)
+        task.progress.connect(lambda value, text: (progress.setValue(min(99, value)), progress.setLabelText(text)))
+        def imported(directory):
+            self.refresh_projects()
+            self.statusBar().showMessage(f"Project imported: {directory.name}. Open it to continue.", 15000)
+        def complete():
+            self.centralWidget().setEnabled(True)
+            progress.close()
+            progress.deleteLater()
+            self._transfer_task = None
+            task.deleteLater()
+        task.succeeded.connect(imported)
+        task.failed.connect(lambda error: QMessageBox.critical(self, "Project import failed", error))
+        task.cancelled.connect(self.statusBar().showMessage)
+        task.finished.connect(complete)
+        task.start()
+
+    def closeEvent(self, event):
+        if self._transfer_task is not None:
+            self.statusBar().showMessage("Wait for project import to finish, or cancel it before closing.")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def refresh_projects(self):
         self.projects = list_projects(self.projects_root)
         self._render_projects()
 
     def _view_changed(self):
+        self.view_combo.setToolTip(self.view_combo.currentData(Qt.ToolTipRole))
         self.settings.setValue("view", self.view_combo.currentData())
         self._render_projects()
 
@@ -370,6 +512,11 @@ class ProjectBrowser(QMainWindow):
         else:
             projects.sort(key=lambda p: p.get("last_saved_at", "") or "", reverse=True)
         self._columns = self._column_count()
+        rows = (len(projects) + self._columns - 1) // self._columns
+        height = {"cards": 263, "rows": 92, "text": 72}[self.view_combo.currentData()]
+        self.grid_host.setMinimumHeight(
+            rows * height + max(0, rows - 1) * self.grid.spacing() if rows else 200
+        )
         for column in range(self._columns):
             self.grid.setColumnStretch(column, 1)
         self.count_label.setText(
@@ -388,6 +535,8 @@ class ProjectBrowser(QMainWindow):
         for i, project in enumerate(projects):
             tile = ProjectTile(project, view=self.view_combo.currentData())
             tile.openRequested.connect(self._open_project_from_tile)
+            tile.deleteRequested.connect(self._delete_project)
+            tile.renameRequested.connect(self._rename_project)
             self.grid.addWidget(tile, i // self._columns, i % self._columns)
 
     def _create_project(self):
@@ -402,3 +551,60 @@ class ProjectBrowser(QMainWindow):
 
     def _open_project_from_tile(self, project_dir):
         self.open_project_callback(project_dir)
+
+    def _delete_project(self, project_dir):
+        target = Path(project_dir)
+        try:
+            root = self.projects_root.resolve(strict=True)
+            resolved = target.resolve(strict=True)
+            if (resolved.parent != root or target.is_symlink()
+                    or target.is_junction() or not resolved.is_dir()):
+                raise ValueError("The project must be a folder directly inside the projects directory.")
+            answer = QMessageBox.question(
+                self, "Delete project",
+                f'Permanently delete "{target.name}"?\n\n'
+                f"This deletes the project folder and all files inside it:\n{resolved}\n\n"
+                "Source recordings outside this folder are kept. This cannot be undone.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            # Recheck the target after the confirmation dialog before deleting.
+            if target.resolve(strict=True) != resolved or target.is_symlink() or target.is_junction():
+                raise ValueError("The project folder changed. Please try again.")
+            shutil.rmtree(resolved)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Could not delete project", str(exc))
+        self.refresh_projects()
+
+    def _rename_project(self, project_dir):
+        project = next((p for p in self.projects if p["project_dir"] == project_dir), None)
+        if project is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Rename project", "Project name:", text=project["project_name"]
+        )
+        if not accepted or not name.strip():
+            return
+        try:
+            old = Path(project_dir).resolve()
+            editors = [window for window in QApplication.topLevelWidgets()
+                       if getattr(window, "current_project_dir", None) is not None
+                       and Path(window.current_project_dir).resolve() == old]
+            if any(getattr(window, "_task", None) is not None for window in editors):
+                raise ValueError("Wait for the project's current operation to finish before renaming.")
+            renamed = rename_project_folder(self.projects_root, old, name.strip())
+            for window in editors:
+                window.current_project_dir = renamed
+                from .recovery import recovery_revision
+                window._recovery_revision = recovery_revision(renamed)
+                window.project_name = renamed.name
+                window.current_session_path = str(renamed / "session.json")
+                if window.loaded_csv_path:
+                    source = Path(window.loaded_csv_path)
+                    if source.is_relative_to(old):
+                        window.loaded_csv_path = str(renamed / source.relative_to(old))
+                window._update_window_title()
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Could not rename project", str(exc))
+        self.refresh_projects()

@@ -9,6 +9,7 @@ from time import monotonic
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PySide6.QtGui import QImage
+from PySide6.QtCore import Qt, QPoint, QTimer
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 
@@ -29,13 +30,13 @@ class StudioTests(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        # Window close now captures recovery state. Keep its project directory
+        # alive until the window cleanup has run (unittest cleanups are LIFO).
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.path = self.root / "events.csv"
         self.path.write_text("t,x,y,p\n10000000,0,0,1\n10000001,1,0,0\n10000002,0,1,-1\n10000003,1,1,1\n", encoding="utf-8")
         self.events = load_events_from_csv(self.path)
-
-    def tearDown(self):
-        self.temp.cleanup()
 
     def window(self):
         window = MainWindow()
@@ -48,6 +49,91 @@ class StudioTests(unittest.TestCase):
         while window._task is not None and monotonic() < deadline:
             QTest.qWait(10)
         self.assertIsNone(window._task, "Background operation did not finish")
+
+    def test_roi_context_actions_and_candidate_preservation(self):
+        window = self.window()
+        menu = window._build_roi_context_menu()
+        self.addCleanup(menu.deleteLater)
+        self.assertFalse(window.btn_rename_roi.isEnabled())
+        self.assertFalse(window.btn_add_roi.isEnabled())
+        window._on_candidate_roi_changed(Roi(0, 0, 1, 1))
+        QTest.mouseClick(window.view, Qt.RightButton, pos=QPoint(1, 1))
+        self.assertIsNotNone(window._candidate_roi)
+        window.rois = [NamedROI(name="Layer", roi=Roi(0, 0, 1, 1), color="#ff0000")]
+        window.active_roi_index = 0
+        window._rebuild_roi_list()
+        menu = window._build_roi_context_menu()
+        self.addCleanup(menu.deleteLater)
+        self.assertTrue(window.btn_add_roi.isEnabled())
+        self.assertTrue(window.btn_rename_roi.isEnabled())
+        visible = next(action for action in menu.actions() if action.text() == "Visible")
+        visible.trigger()
+        self.assertFalse(window.rois[0].visible)
+        window.btn_duplicate_roi.trigger()
+        self.assertEqual(len(window.rois), 2)
+
+    def test_image_context_selects_roi_under_pointer(self):
+        window = self.window()
+        window.rois = [NamedROI(name="Layer", roi=Roi(0, 0, 1, 1), color="#ff0000")]
+        window._rebuild_roi_list()
+        QTimer.singleShot(0, lambda: QApplication.activePopupWidget().close())
+        with patch.object(window.view, "_widget_to_image", return_value=(0, 0)):
+            window._show_roi_context_menu(window.view, QPoint(1, 1))
+        self.assertEqual(window.active_roi_index, 0)
+
+    def test_slice_context_menu_actions_and_timeline_selection(self):
+        window = self.window()
+        menu = window._build_slice_context_menu()
+        self.addCleanup(menu.deleteLater)
+        self.assertTrue(window.btn_add_slice.isEnabled())
+        self.assertFalse(window.btn_delete_slice.isEnabled())
+        with patch("event_studio.app.QInputDialog.getText", return_value=("Section", True)):
+            window.btn_add_slice.trigger()
+        self.assertEqual(len(window.slices), 1)
+        window.slice_list.setCurrentRow(-1)
+        QTimer.singleShot(0, lambda: QApplication.activePopupWidget().close())
+        with patch.object(window.timeline, "_hit_test_slice", return_value=(0, "move")):
+            window._show_slice_context_menu(window.timeline, QPoint(10, 10))
+        self.assertEqual(window.slice_list.currentRow(), 0)
+        self.assertTrue(window.btn_delete_slice.isEnabled())
+        window.btn_loop_slice.trigger()
+        self.assertEqual(window.loop_slice_index, 0)
+        self.assertEqual(window.btn_loop_slice.text(), "Stop Loop")
+        window.btn_delete_slice.trigger()
+        self.assertEqual(window.slices, [])
+        self.assertIsNone(window.loop_slice_index)
+
+    def test_file_actions_follow_empty_loaded_and_reset_state(self):
+        window = MainWindow()
+        self.addCleanup(window.close)
+        self.assertTrue(all(not action.isEnabled() for action in window._recording_file_actions))
+
+        self.assertFalse(window._rename_project_action.isEnabled())
+        window.current_project_dir = self.root
+        window._update_file_menu_actions()
+        self.assertTrue(window._rename_project_action.isEnabled())
+        window._load_csv_into_app(self.path, "test", prepared_events=self.events)
+        window._update_file_menu_actions()
+        self.assertTrue(all(action.isEnabled() for action in window._recording_file_actions))
+        window._reset_view()
+        self.assertTrue(all(action.isEnabled() for action in window._recording_file_actions))
+        window._clear_recording()
+        self.assertTrue(all(not action.isEnabled() for action in window._recording_file_actions))
+
+
+    def test_studio_header_tracks_title_and_window_controls(self):
+        window = self.window()
+        window.show()
+        self.assertTrue(window.windowFlags() & Qt.FramelessWindowHint)
+        self.assertIs(window.menuWidget(), window.studio_header)
+        window.setWindowTitle("Studio title")
+        self.assertEqual(window.studio_header.title.text(), "Studio title")
+        window.studio_header.maximize.click()
+        self.assertTrue(window.isMaximized())
+        window.studio_header.maximize.click()
+        self.assertFalse(window.isMaximized())
+        window.studio_header.close_button.click()
+        self.assertFalse(window.isVisible())
 
     def test_exact_integer_csv_and_headerless_first_row(self):
         self.path.write_text("1,0,-1,9007199254740993\n0,1,1,9007199254740994\n", encoding="utf-8")
@@ -135,10 +221,11 @@ class StudioTests(unittest.TestCase):
         window.slices = [Slice("exact", 10000001, 10000003, polarity="neg")]
         window._rebuild_slice_list()
         window.slice_list.setCurrentRow(0)
+        window.duration_us = 1
         window._jump_to_selected_slice()
-        self.assertEqual(window._current_window(), (10000001, 10000003))
+        self.assertEqual(window._current_window(), (10000001, 10000002))
         window._zoom_interval()
-        self.assertEqual((window.zoom_start, window.zoom_end), (10000001, 10000003))
+        self.assertEqual((window.zoom_start, window.zoom_end), (10000001, 10000002))
         window.step_us.setValue(1)
         window.is_playing = True
         window._on_tick()
@@ -183,6 +270,32 @@ class StudioTests(unittest.TestCase):
         self.assertEqual(window.position_us, 10000001)
         self.assertEqual(window.slices[0].roi_id, window.rois[0].id)
         self.assertEqual(window.slices[0].roi_snapshot, {"x": 0, "y": 0, "w": 1, "h": 2})
+
+    def test_opening_replacement_recording_refreshes_existing_project_preview(self):
+        from unittest.mock import Mock
+        window = self.window()
+        window.current_project_dir = self.root / 'project'
+        window.save_project()
+        self.wait_worker(window)
+        project = window.current_project_dir
+        saved_session = (project / 'session.json').read_bytes()
+        old_thumb = (project / 'thumbnail.png').read_bytes()
+        old_preview = (project / 'preview_frames' / 'frame_00.png').read_bytes()
+        replacement = self.root / 'replacement.csv'
+        replacement.write_text('t,x,y,p\n1,3,3,1\n2,3,3,1\n', encoding='utf-8')
+        window.browser_ref = Mock()
+        window._open_recording_path(replacement)
+        self.wait_worker(window)
+        self.assertEqual(Path(window.loaded_csv_path), replacement.resolve())
+        self.assertNotEqual((project / 'thumbnail.png').read_bytes(), old_thumb)
+        self.assertNotEqual((project / 'preview_frames' / 'frame_00.png').read_bytes(), old_preview)
+        self.assertEqual(len(list((project / 'preview_frames').glob('*.png'))), 10)
+        self.assertEqual((project / 'session.json').read_bytes(), saved_session)
+        window.browser_ref.refresh_projects.assert_called()
+        # Saving afterwards must keep the replacement artwork and source.
+        window.save_project()
+        self.wait_worker(window)
+        self.assertEqual(json.loads((project / 'session.json').read_text())['source']['loaded_name'], replacement.stem)
 
     def test_background_open_save_and_restore(self):
         window = MainWindow()

@@ -26,8 +26,13 @@ from .viewer import compute_roi_stats
 
 
 class ActivityPlotWindow(QWidget):
+    seekRequested = Signal(object)
+    intervalRequested = Signal(object, object)
+
     def __init__(self, parent=None) -> None:
-        super().__init__(parent)
+        super().__init__(parent, Qt.Window)
+        from .theme import appearance_controller
+        appearance_controller().watch_window(self)
         self.setWindowTitle("ROI Activity Plot")
         self.resize(820, 520)
 
@@ -42,7 +47,17 @@ class ActivityPlotWindow(QWidget):
 
         self.figure = Figure(figsize=(7, 4), dpi=100)
         self.canvas = FigureCanvas(self.figure)
+        from .plot_navigation import PlotNavigation
+        self._origin_us = 0
+        self.navigation = PlotNavigation(self.canvas, self.seekRequested.emit, self.intervalRequested.emit,
+                                         lambda: self._origin_us)
+        self.canvas.setToolTip("Click to seek playback. Drag across time to save a slice.")
         root.addWidget(self.canvas, stretch=1)
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.close)
+        root.addWidget(self.btn_close, alignment=Qt.AlignRight)
+        from .window_chrome import install_window_header
+        install_window_header(self)
 
     def set_plot_data(
         self,
@@ -54,7 +69,11 @@ class ActivityPlotWindow(QWidget):
         pos_counts: np.ndarray,
         neg_counts: np.ndarray,
         current_time_ms: float,
+        origin_us: int = 0,
+        slice_context=None,
     ) -> None:
+        self._origin_us = origin_us
+        self.slice_context = slice_context
         self.info_label.setText(
             f'ROI Activity Plot — "{roi_name}"\n'
             f"Source: {loaded_name}\n"
@@ -70,7 +89,7 @@ class ActivityPlotWindow(QWidget):
         ax.axvline(current_time_ms, linestyle="--", label="Current time")
 
         ax.set_title(f'ROI Activity Over Time — "{roi_name}"')
-        ax.set_xlabel("Time (ms)")
+        ax.set_xlabel(f"Time since {origin_us} us (ms); click to seek, drag to save slice")
         ax.set_ylabel("Events per bin")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -81,7 +100,9 @@ class ActivityPlotWindow(QWidget):
 
 class SpatialPlotWindow(QWidget):
     def __init__(self, parent=None) -> None:
-        super().__init__(parent)
+        super().__init__(parent, Qt.Window)
+        from .theme import appearance_controller
+        appearance_controller().watch_window(self)
         self.setWindowTitle("ROI Spatial Plot")
         self.resize(860, 760)
 
@@ -100,6 +121,9 @@ class SpatialPlotWindow(QWidget):
         button_row.addWidget(self.btn_mode_raw)
         button_row.addWidget(self.btn_mode_time)
         button_row.addStretch(1)
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.close)
+        button_row.addWidget(self.btn_close)
         root.addLayout(button_row)
 
         self.figure = Figure(figsize=(6, 6), dpi=100)
@@ -111,6 +135,8 @@ class SpatialPlotWindow(QWidget):
 
         self.btn_mode_raw.clicked.connect(self._set_raw_mode)
         self.btn_mode_time.clicked.connect(self._set_time_mode)
+        from .window_chrome import install_window_header
+        install_window_header(self)
 
     def _set_raw_mode(self) -> None:
         self._mode = "raw"
@@ -197,6 +223,8 @@ class SpatialPlotWindow(QWidget):
 
 class ROIAnalysisPanel(QWidget):
     closeRequested = Signal()
+    seekRequested = Signal(object)
+    intervalRequested = Signal(object, object)
 
     TRAIL_UPDATE_INTERVAL_SEC = 0.25
     MIN_PLAYHEAD_DELTA_US = 30_000
@@ -296,7 +324,7 @@ class ROIAnalysisPanel(QWidget):
         self.full_stats_label.setWordWrap(True)
         self.full_stats_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.full_stats_label.setStyleSheet(
-            "background: #171717; padding: 8px; border: 1px solid #2f2f2f;"
+            "background: #24212d; padding: 8px; border: 1px solid #48424f;"
         )
         root.addWidget(self.full_stats_label)
 
@@ -304,7 +332,7 @@ class ROIAnalysisPanel(QWidget):
         self.window_stats_label.setWordWrap(True)
         self.window_stats_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.window_stats_label.setStyleSheet(
-            "background: #171717; padding: 8px; border: 1px solid #2f2f2f;"
+            "background: #24212d; padding: 8px; border: 1px solid #48424f;"
         )
         root.addWidget(self.window_stats_label)
 
@@ -314,6 +342,9 @@ class ROIAnalysisPanel(QWidget):
         return 100.0 * pos / total
 
     def clear_analysis(self) -> None:
+        for window in (self._plot_window, self._spatial_plot_window):
+            if window is not None:
+                window.close()
         self.title_label.setText("ROI Analysis")
         self.subtitle_label.setText("No ROI selected.")
         self.full_stats_label.setText("Full ROI stats: —")
@@ -478,41 +509,23 @@ class ROIAnalysisPanel(QWidget):
         return rgb
 
     def _build_activity_plot_payload(self, events, roi: Roi, roi_name: str, loaded_name: str, current_t_end_us: int) -> dict:
-        _xs, _ys, ts, ps, _w, _h = self._extract_roi_events(events, roi)
-
-        if ts.size == 0:
-            return {
-                "roi_name": roi_name,
-                "loaded_name": loaded_name,
-                "times_ms": np.array([0.0]),
-                "total_counts": np.array([0]),
-                "pos_counts": np.array([0]),
-                "neg_counts": np.array([0]),
-                "current_time_ms": current_t_end_us / 1000.0,
-            }
-
-        t0 = int(ts.min())
-        t1 = int(ts.max())
-        span_us = max(1, t1 - t0)
-
-        n_bins = int(np.clip(span_us / 2000, 60, 300))
-        edges = np.linspace(t0, t1, n_bins + 1)
-
-        total_counts, _ = np.histogram(ts, bins=edges)
-        pos_counts, _ = np.histogram(ts[ps > 0], bins=edges)
-        neg_counts, _ = np.histogram(ts[ps <= 0], bins=edges)
-
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        times_ms = centers / 1000.0
-
+        from .activity import activity_series
+        origin = int(events.t[0])
+        end = int(events.t[-1]) + 1
+        bin_us = max(1, (end - origin + 299) // 300)
+        series = activity_series(events, origin, end, bin_us, roi)
+        centers = (series.start_us - origin) / 1000.0 + (series.end_us - series.start_us) / 2000.0
         return {
             "roi_name": roi_name,
             "loaded_name": loaded_name,
-            "times_ms": times_ms,
-            "total_counts": total_counts,
-            "pos_counts": pos_counts,
-            "neg_counts": neg_counts,
-            "current_time_ms": current_t_end_us / 1000.0,
+            "times_ms": centers,
+            "total_counts": series.total,
+            "pos_counts": series.positive,
+            "neg_counts": series.negative,
+            "current_time_ms": (current_t_end_us - origin) / 1000.0,
+            "origin_us": origin,
+            "slice_context": {"source_sha256": events.metadata.get("sha256"),
+                              "roi_snapshot": vars(roi).copy(), "polarity": "both", "filters": {}},
         }
 
     def _build_spatial_plot_payload(self, events, roi: Roi, roi_name: str, loaded_name: str) -> dict:
@@ -542,6 +555,8 @@ class ROIAnalysisPanel(QWidget):
 
         if self._plot_window is None:
             self._plot_window = ActivityPlotWindow(self)
+            self._plot_window.seekRequested.connect(self.seekRequested.emit)
+            self._plot_window.intervalRequested.connect(self.intervalRequested.emit)
 
         self._plot_window.set_plot_data(**self._last_plot_payload)
         self._plot_window.show()

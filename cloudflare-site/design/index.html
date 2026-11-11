@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Event-Based Studio is a Windows application for viewing and analysing event camera recordings.">
+  <meta name="theme-color" content="#100a1c">
+  <title>Event-Based Studio</title>
+  <link rel="icon" href="assets/logo.png"><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="theme-event-output.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="wrap"><a class="brand" href="#" aria-label="Event-Based Studio home"><img src="assets/logo.png" alt="Event-Based Studio"></a><nav aria-label="Main"><a href="#software">Software</a></nav></header>
+  <main id="main">
+    <section class="hero">
+      <div class="hero-media" aria-hidden="true">
+        <video class="is-active" data-title="Flowing fabric" muted playsinline preload="metadata" poster="assets/motion/dance.jpg" aria-label="A contemporary dancer moving with flowing fabric"><source src="assets/motion/dance.mp4" type="video/mp4"></video>
+        <video data-title="Traffic" muted playsinline preload="none" poster="assets/motion/traffic.jpg" aria-label="Cars moving along a city road"><source src="assets/motion/traffic.mp4" type="video/mp4"></video>
+        <video data-title="Grains" muted playsinline preload="none" poster="assets/motion/sand.jpg" aria-label="Grains of sand falling between hands"><source src="assets/motion/sand.mp4" type="video/mp4"></video>
+        <video data-title="Water" muted playsinline preload="none" poster="assets/motion/water.jpg" aria-label="Water splashing and flowing"><source src="assets/motion/water.mp4" type="video/mp4"></video>
+        <video data-title="Flight" muted playsinline preload="none" poster="assets/motion/birds.jpg" aria-label="Birds flying across the sky"><source src="assets/motion/birds.mp4" type="video/mp4"></video>
+      </div>
+      <div class="wrap hero-copy"><h1 class="hero-mark"><img src="assets/logo.png" alt="Event-Based Studio"></h1><p>View and analyse event camera recordings.<br>Inspect motion, select regions, and measure events over time.</p></div>
+      <div class="wrap motion-meta"><span class="footage-credit">Stock footage · <a href="documents/STOCK-FOOTAGE.txt">Credits</a></span></div>
+    </section>
+    <section class="wrap software" id="software">
+      <div class="section-heading"><h2>View, measure, and compare.</h2><div class="software-description"><p>Event-Based Studio brings recorded event data and live camera viewing into one desktop application. Open a CSV recording, move through its timeline, and select the regions and intervals you want to examine.</p><p>Compare activity between regions, filter event polarity, add annotations, and export your measurements. Projects retain the recording settings and analysis context, so you can return to an observation or share it with a colleague.</p></div></div>
+      <figure class="app-shot"><img src="assets/studio.png" alt="Event-Based Studio displaying a hand recording with selected hand and part regions, event polarity and timeline controls" width="1597" height="949" loading="lazy"><figcaption>A hand recording with two regions selected for analysis.</figcaption></figure>
+      <div class="features"><article><h3>View and compare</h3><p>Play recordings, filter event polarity, select regions, and compare activity over time.</p></article><article><h3>Measure and export</h3><p>Inspect intervals, run analysis, add annotations, and export event data or PNG images.</p></article><article><h3>Save your work</h3><p>Keep projects locally, recover unsaved changes, and move a project between computers with an .ebs file.</p></article></div>
+      <div class="applications">
+        <article><figure><img src="assets/industry/event-camera-output.jpg" width="1597" height="949" loading="lazy" class="event-output" alt="Running cheetah shown as conventional frames above and event camera data below"><figcaption>Event camera output &middot; TimoStoffregen &middot; CC BY-SA 4.0</figcaption></figure><h3>Live camera mode</h3><p>Connect a compatible event camera and view incoming events while you adjust the setup. Inspect the live stream in RAW or Studio view, then record it to CSV for a closer examination afterward.</p><p>Live acquisition requires the native Metavision SDK and a supported camera driver, installed separately.</p></article>
+        <article><figure><img src="assets/industry/manufacturing.jpg" width="1597" height="949" loading="lazy" alt="Packs of water bottles travelling along a factory conveyor belt"><figcaption>Bottles on a production conveyor &middot; Stock photograph</figcaption></figure><h3>Factories and manufacturing</h3><p>Use event recordings from production trials to study repetitive machinery, moving parts, or material flow. Select areas of a process, compare their activity over time, and examine the timing of individual movements.</p><p>This can support process investigation, equipment studies, and the development of inspection methods. Save regions, notes, and intervals with the project to keep each observation traceable.</p></article>
+      </div>
+      <p class="photo-note">Photographs illustrate industrial applications; they do not show an Event-Based Studio installation. <a href="documents/PHOTO-CREDITS.txt">Image credits</a></p>
+    </section>
+    <section class="download-band" id="download"><div class="wrap download-grid"><div><h2>Download</h2><p>For Windows 10 and 11, 64-bit.<br>Python is included.</p><p class="muted small">Version 2.0.0rc1 · Unsigned build.<br>Clean-PC testing is still in progress.</p></div><div class="download-panel"><button class="button" data-download="application">Download for Windows <span aria-hidden="true">↓</span></button><p id="download-status" role="status" aria-live="polite"></p><ol><li>Install the <a href="https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist" target="_blank" rel="noopener">Microsoft C++ x64 runtime</a> if needed.</li><li>Extract the ZIP and run <code>Event-Based-Studio.exe</code>.</li><li>Keep the <code>_internal</code> folder beside the application.</li></ol><div class="download-links"><a href="documents/RELEASE-NOTES.txt">Release notes</a><a href="documents/SHA256SUMS.txt">Checksums</a><button class="text-button" data-download="source">Qt / PySide source</button><a href="documents/THIRD-PARTY.txt">Third-party licenses</a></div></div></div></section>
+    <section class="wrap notes" id="support"><div><h3>Local files. No account.</h3><p>Your recordings and projects stay on your computer. The app has no telemetry or automatic uploads.</p><a href="documents/PRIVACY.txt">Privacy information</a></div><div><h3>CSV, cameras, and other formats</h3><p>CSV, DAT and H5/HDF5 event recordings open with bundled readers, including ECF compression. No WSL or OpenEB setup is needed. Live cameras still need the Metavision SDK and drivers.</p><a href="documents/SUPPORT.txt">Setup and troubleshooting</a></div></section>
+  </main>
+  <footer class="wrap"><span>© 2026 Alpha Makuza</span><div><a href="documents/LICENSE.txt">License</a><a href="documents/PRIVACY.txt">Privacy</a><a href="documents/STOCK-FOOTAGE.txt">Footage credits</a><a href="documents/PHOTO-CREDITS.txt">Image credits</a></div></footer>
+  <script src="downloads.js" defer></script><script src="motion.js" defer></script>
+</body></html>

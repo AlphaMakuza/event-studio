@@ -4,13 +4,15 @@ from typing import List, Optional
 
 from PySide6.QtCore import Qt, QRect, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QSlider
+from PySide6.QtWidgets import QSlider, QStyle, QStyleOptionSlider
 
 
 class TimelineSlider(QSlider):
     sliceSelected = Signal(int)
     sliceEdited = Signal(int, int, int)  # index, start_value, end_value
     markerSelected = Signal(int)
+    editStarted = Signal()
+    editFinished = Signal()
 
     def __init__(self, orientation=Qt.Horizontal, parent=None) -> None:
         super().__init__(orientation, parent)
@@ -25,38 +27,50 @@ class TimelineSlider(QSlider):
         self._drag_end_value: int = 0
         self._handle_px = 8
         self._analysis_markers = []
-        self.setMinimumHeight(40)
+        self._scrubbing = False
+        self.setMinimumHeight(52)
+        self.setToolTip("Drag the playback handle or click its track to seek. Saved slices are in the separate row above; drag their ends to resize. Yellow/orange bars below the track are activity bursts found by Advanced Analysis: periods above your chosen event-rate threshold. Click a burst to inspect its interval. These are not saved slices or notes.")
 
     def set_analysis_markers(self, markers):
         self._analysis_markers = markers
         self.update()
 
     def set_slice_regions(self, regions: List[dict], selected_index: Optional[int] = None) -> None:
+        if self._drag_slice_index is not None and not any(r['index'] == self._drag_slice_index for r in regions):
+            self._drag_mode = self._drag_slice_index = None
+            self.editFinished.emit()
         self._slice_regions = regions
         self._selected_slice_index = selected_index
         self.update()
 
     def clear_slice_regions(self) -> None:
+        if self._drag_mode is not None:
+            self._drag_mode = self._drag_slice_index = None
+            self.editFinished.emit()
         self._slice_regions = []
         self._selected_slice_index = None
         self.update()
 
-    def _value_to_x(self, value: int) -> int:
-        vmin = self.minimum()
-        vmax = self.maximum()
-        if vmax <= vmin:
-            return 8
+    def track_bounds(self):
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        option.sliderPosition = option.sliderValue = self.minimum()
+        left = self.style().subControlRect(QStyle.CC_Slider, option, QStyle.SC_SliderHandle, self).center().x()
+        option.sliderPosition = option.sliderValue = self.maximum()
+        right = self.style().subControlRect(QStyle.CC_Slider, option, QStyle.SC_SliderHandle, self).center().x()
+        return left, right
 
-        usable_w = max(1, self.width() - 16)
-        frac = (value - vmin) / (vmax - vmin)
-        return 8 + int(frac * usable_w)
+    def _value_to_x(self, value: int) -> int:
+        left, right = self.track_bounds()
+        span = max(1, self.maximum() - self.minimum())
+        return left + round((value - self.minimum()) * (right - left) / span)
 
     def _x_to_value(self, x: int) -> int:
         vmin = self.minimum()
         vmax = self.maximum()
-        usable_w = max(1, self.width() - 16)
-        clamped_x = max(8, min(self.width() - 8, x))
-        frac = (clamped_x - 8) / usable_w
+        left, right = self.track_bounds()
+        clamped_x = max(min(left, right), min(max(left, right), x))
+        frac = (clamped_x - left) / (right - left or 1)
         return int(round(vmin + frac * (vmax - vmin)))
 
     def _region_rect(self, region: dict) -> QRect:
@@ -65,7 +79,7 @@ class TimelineSlider(QSlider):
         if x1 < x0:
             x0, x1 = x1, x0
 
-        track_y = self.height() // 2 - 12
+        track_y = 2
         track_h = 8
         width = max(6, x1 - x0)
         return QRect(x0, track_y, width, track_h)
@@ -101,6 +115,7 @@ class TimelineSlider(QSlider):
 
                 region = next((r for r in self._slice_regions if r["index"] == idx), None)
                 if region is not None:
+                    self.editStarted.emit()
                     self._drag_mode = mode
                     self._drag_slice_index = idx
                     self._drag_start_value = int(region["start_value"])
@@ -111,6 +126,12 @@ class TimelineSlider(QSlider):
                     event.accept()
                     return
 
+        if event.button() == Qt.LeftButton:
+            self._scrubbing = True
+            self.setSliderDown(True)
+            self.setValue(self._x_to_value(int(event.position().x())))
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -148,15 +169,26 @@ class TimelineSlider(QSlider):
             event.accept()
             return
 
+        if self._scrubbing:
+            self.setValue(self._x_to_value(int(event.position().x())))
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if self._drag_mode is not None:
             self._drag_mode = None
             self._drag_slice_index = None
+            self.editFinished.emit()
             event.accept()
             return
 
+        if self._scrubbing:
+            self.setValue(self._x_to_value(int(event.position().x())))
+            self._scrubbing = False
+            self.setSliderDown(False)
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event) -> None:

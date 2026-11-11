@@ -98,6 +98,17 @@ def save_preview_frames(project_dir: Path, frames: list[np.ndarray]) -> list[str
     return saved
 
 
+def save_recording_preview(project_dir: Path, frames: list[np.ndarray]) -> None:
+    """Replace browser artwork while leaving saved analysis and source untouched."""
+    if not frames:
+        return
+    files = save_preview_frames(project_dir, frames)
+    _save_gray_png(frames[0], thumbnail_path(project_dir))
+    meta = load_json(metadata_json_path(project_dir), default={}) or {}
+    meta.update(thumbnail="thumbnail.png", preview_frames=files)
+    save_json(metadata_json_path(project_dir), meta)
+
+
 def load_json(path: Path, default: Any = None) -> Any:
     if not path.exists():
         return default
@@ -114,6 +125,8 @@ def save_json(path: Path, payload: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -164,16 +177,74 @@ def rename_project(project_dir: Path, new_name: str) -> None:
     save_json(metadata_json_path(project_dir), meta)
 
 
+def rename_project_folder(projects_root: Path, project_dir: Path, new_name: str) -> Path:
+    """Rename a project and rebase references to files stored inside its folder."""
+    original = Path(project_dir)
+    source = original.resolve(strict=True)
+    root = Path(projects_root).resolve(strict=True)
+    if (source.parent != root or original.is_symlink() or original.is_junction()
+            or not source.is_dir()):
+        raise ValueError("The project must be a folder directly inside the projects directory.")
+    name = sanitize_project_name(new_name).rstrip(". ")
+    if not name or name in (".", "..") or Path(name).is_reserved():
+        raise ValueError("Please choose a valid project folder name.")
+    destination = root / name
+    if destination.exists() and destination.resolve() != source:
+        raise ValueError("A project with that folder name already exists.")
+
+    def rebase(value):
+        if isinstance(value, dict):
+            return {key: rebase(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [rebase(item) for item in value]
+        if isinstance(value, str):
+            path = Path(value)
+            if path.is_absolute():
+                path = path.resolve()
+                if path.is_relative_to(source):
+                    return str(destination / path.relative_to(source))
+        return value
+
+    updates = []
+    for filename in ("metadata.json", "session.json", ".autosave.json", ".autosave.previous.json"):
+        path = source / filename
+        if path.exists():
+            with path.open(encoding="utf-8") as stream:
+                old = json.load(stream)
+            updated = rebase(old)
+            updated["project_name"] = name
+            if filename.startswith(".autosave") and isinstance(updated.get("session"), dict):
+                updated["session"]["project_name"] = name
+            updates.append((filename, old, updated))
+        elif filename == "metadata.json":
+            updates.append((filename, None, {"project_name": name}))
+    source.rename(destination)
+    try:
+        for filename, _, updated in updates:
+            save_json(destination / filename, updated)
+    except Exception:
+        for filename, old, _ in updates:
+            if old is None:
+                (destination / filename).unlink(missing_ok=True)
+            else:
+                save_json(destination / filename, old)
+        destination.rename(source)
+        raise
+    return destination
+
+
 def list_projects(projects_root: Path) -> list[dict]:
     ensure_projects_root(projects_root)
 
     projects: list[dict] = []
     for child in projects_root.iterdir():
-        if not child.is_dir():
+        if child.name.startswith(".") or not child.is_dir() or child.is_symlink() or child.is_junction():
             continue
 
         meta = load_json(metadata_json_path(child), default={}) or {}
         sess_exists = session_json_path(child).exists()
+        from .recovery import recovery_available
+        has_recovery = recovery_available(child)
         thumb = thumbnail_path(child)
         pdir = preview_dir(child)
 
@@ -199,6 +270,7 @@ def list_projects(projects_root: Path) -> list[dict]:
                 "thumbnail_path": str(thumb) if thumb.exists() else "",
                 "preview_frames": preview_files,
                 "has_session": sess_exists,
+                "has_recovery": has_recovery,
             }
         )
 

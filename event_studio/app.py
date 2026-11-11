@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from .edit_history import EditHistory, record_edit
 import sys
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
@@ -9,7 +11,7 @@ from typing import Optional, Tuple, List
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QAction, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,8 +42,8 @@ from PySide6.QtWidgets import (
 from .science import select, export_csv, polarity_ratio
 from . import rendering
 from .workers import Task
+from .theme import StudioMenu as QMenu
 
-from .convert import convert_dat_to_h5_windows, h5_to_csv_windows
 from .viewer import (
     load_events_from_csv,
     infer_hw,
@@ -62,11 +64,13 @@ from .analysis_window import ROIAnalysisPanel
 from .timeline_slider import TimelineSlider
 
 
-def _try_show_boot(app: QApplication, on_done=None) -> None:
+def _try_show_boot(app: QApplication, on_done=None, steps=(), on_error=None) -> None:
     try:
         from .boot import show_boot  # type: ignore
-        app.boot_overlay = show_boot(app, on_done=on_done)  # keep startup/audio alive
+        app.boot_overlay = show_boot(app, on_done=on_done, steps=steps, on_error=on_error)
     except Exception:
+        for _, action in steps:
+            action()
         if on_done:
             on_done()
 
@@ -130,7 +134,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Event-Based Studio")
 
-        self.project_root = Path(__file__).resolve().parents[1]
+        from .paths import storage_root
+        self.project_root = storage_root()
         self.data_dir = self.project_root / "data"
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -176,7 +181,9 @@ class MainWindow(QMainWindow):
         self._workspace = None
         self._live_window = None
 
-        central = QWidget()
+        from .glass_surface import GlassSurface
+        central = GlassSurface()
+        central.setObjectName("StudioSurface")
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(10, 10, 10, 10)
@@ -188,7 +195,7 @@ class MainWindow(QMainWindow):
 
         self.view = ROILabel()
         self.view.setMinimumSize(360, 300)
-        self.view.set_help_text("File → Import .dat to preview")
+        self.view.set_help_text("File → Open recording to begin")
         self.view.roiChanged.connect(self._on_candidate_roi_changed)
         self.view.roiMoved.connect(self._on_active_roi_moved)
         self.compare_view = ROILabel()
@@ -212,6 +219,10 @@ class MainWindow(QMainWindow):
         sidebar_scroll = QScrollArea()
         sidebar_scroll.setWidgetResizable(True)
         sidebar_scroll.setWidget(sidebar)
+        # Let the translucent studio surface show through the scroll container.
+        sidebar.setAutoFillBackground(False)
+        sidebar_scroll.viewport().setAutoFillBackground(False)
+        sidebar_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         sidebar_scroll.setMinimumWidth(350)
         top.addWidget(sidebar_scroll, stretch=2)
 
@@ -244,13 +255,13 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(self.view_mode_hint)
         self.polarity_combo = QComboBox()
         self.polarity_combo.addItems(["both", "pos", "neg"])
-        polarity_label = QLabel("Non-destructive polarity filter (view, window stats, new slices)")
+        polarity_label = QLabel("Choose which events to show")
         polarity_label.setWordWrap(True)
         view_layout.addWidget(polarity_label)
         view_layout.addWidget(self.polarity_combo)
         self.polarity_combo.currentTextChanged.connect(self._render_from_ui)
-        self.polarity_combo.setToolTip("both = all events; pos = positive; neg = negative. The source recording remains unchanged.")
-        self.compare_check = QCheckBox("Compare with unfiltered RAW")
+        self.polarity_combo.setToolTip("both shows all events. pos shows increases in brightness. neg shows decreases in brightness. Your recording stays unchanged.")
+        self.compare_check = QCheckBox("Compare with the unfiltered view")
         self.compare_check.toggled.connect(self._toggle_comparison)
         view_layout.addWidget(self.compare_check)
         self.persistence_ms = QDoubleSpinBox()
@@ -278,47 +289,49 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(self.heat_scale)
 
         arrow_row1 = QHBoxLayout()
-        arrow_row1.addWidget(QLabel("Spacing px"))
+        arrow_row1.addWidget(QLabel("Arrow spacing (px)"))
         self.arrow_grid_spin = QSpinBox()
         self.arrow_grid_spin.setRange(8, 128)
         self.arrow_grid_spin.setValue(24)
         self.arrow_grid_spin.valueChanged.connect(self._render_from_ui)
         arrow_row1.addWidget(self.arrow_grid_spin)
 
-        arrow_row1.addWidget(QLabel("Display ×"))
+        arrow_row1.addWidget(QLabel("Arrow length ×"))
         self.arrow_scale_spin = QDoubleSpinBox()
         self.arrow_scale_spin.setRange(0.2, 10.0)
         self.arrow_scale_spin.setSingleStep(0.2)
         self.arrow_scale_spin.setValue(1.0)
-        self.arrow_grid_spin.setToolTip("Arrow sampling spacing; matching patches are twice this size. Search radius is half the spacing. Larger spacing adds context but can combine distinct motions.")
-        self.arrow_scale_spin.setToolTip("Glyph length multiplier only. 1× displays the estimated pixel displacement between the two half-windows.")
+        self.arrow_grid_spin.setToolTip("Distance between arrows in image pixels. Smaller values show more arrows and finer detail; larger values compare bigger areas and may combine nearby movements.")
+        self.arrow_scale_spin.setToolTip("Makes arrows longer or shorter on screen. 1× shows the estimated movement in pixels; changing this does not change the measurement.")
         self.arrow_scale_spin.valueChanged.connect(self._render_from_ui)
         arrow_row1.addWidget(self.arrow_scale_spin)
         view_layout.addLayout(arrow_row1)
 
         arrow_row2 = QHBoxLayout()
-        arrow_row2.addWidget(QLabel("Min events"))
+        arrow_row2.addWidget(QLabel("Events needed"))
         self.arrow_min_events_spin = QSpinBox()
         self.arrow_min_events_spin.setRange(1, 500)
         self.arrow_min_events_spin.setValue(10)
+        self.arrow_min_events_spin.setToolTip("Minimum events needed in a local area before estimating movement. Raise this to hide arrows in sparse areas; lower it to show more estimates.")
         self.arrow_min_events_spin.valueChanged.connect(self._render_from_ui)
         arrow_row2.addWidget(self.arrow_min_events_spin)
 
-        arrow_row2.addWidget(QLabel("Silhouette"))
+        arrow_row2.addWidget(QLabel("Background brightness"))
         self.arrow_silhouette_spin = QDoubleSpinBox()
         self.arrow_silhouette_spin.setRange(0.0, 1.0)
         self.arrow_silhouette_spin.setSingleStep(0.05)
         self.arrow_silhouette_spin.setValue(0.40)
+        self.arrow_silhouette_spin.setToolTip("Brightness of the event image behind the arrows: 0 hides it, 1 shows full brightness. This changes appearance only.")
         self.arrow_silhouette_spin.valueChanged.connect(self._render_from_ui)
         arrow_row2.addWidget(self.arrow_silhouette_spin)
         view_layout.addLayout(arrow_row2)
         arrow_row3=QHBoxLayout()
-        arrow_row3.addWidget(QLabel('Match quality'))
+        arrow_row3.addWidget(QLabel('Match strictness'))
         self.arrow_quality_spin=QDoubleSpinBox()
         self.arrow_quality_spin.setRange(0,1)
         self.arrow_quality_spin.setSingleStep(.05)
         self.arrow_quality_spin.setValue(.65)
-        self.arrow_quality_spin.setToolTip('Minimum normalized patch correlation. Ambiguous, one-dimensional, stationary, search-limit and reverse-inconsistent matches are also suppressed. This is not a confidence probability.')
+        self.arrow_quality_spin.setToolTip('How closely event patterns must match before showing an arrow (0–1). Higher values show fewer, stronger matches. This score is not a probability of correctness.')
         self.arrow_quality_spin.valueChanged.connect(self._render_from_ui)
         arrow_row3.addWidget(self.arrow_quality_spin)
         view_layout.addLayout(arrow_row3)
@@ -334,76 +347,57 @@ class MainWindow(QMainWindow):
         roi_layout = QVBoxLayout(roi_box)
         roi_layout.setSpacing(6)
 
-        self.roi_status = QLabel(
-            "Candidate: None (drag on image to create)\n"
-            "Tip: select a visible ROI below, then drag inside it to move it or drag a corner to resize it."
-        )
+        self.roi_status = QLabel("Drag on the image to create an ROI")
         self.roi_status.setWordWrap(True)
+        self.roi_status.setStyleSheet("color: #b5acbf; font-size: 11px;")
         roi_layout.addWidget(self.roi_status)
 
-        self.chk_show_rois = QCheckBox("Show ROI overlays")
-        self.chk_show_rois.setChecked(True)
-        self.chk_show_rois.stateChanged.connect(self._on_toggle_roi_overlays)
-        roi_layout.addWidget(self.chk_show_rois)
-
-        self.btn_add_roi = QPushButton("Add ROI (name it)")
-        self.btn_add_roi.setEnabled(False)
-        self.btn_add_roi.clicked.connect(self._add_roi_from_candidate)
-        roi_layout.addWidget(self.btn_add_roi)
-
-        self.btn_clear_candidate = QPushButton("Clear candidate (right-click too)")
-        self.btn_clear_candidate.clicked.connect(self._clear_candidate_roi)
-        roi_layout.addWidget(self.btn_clear_candidate)
-
         self.roi_list = QListWidget()
-        self.roi_list.setMinimumHeight(160)
+        self.roi_list.setAccessibleName("ROI layers")
+        self.roi_list.setMinimumHeight(180)
+        self.roi_list.setSpacing(1)
+        self.roi_list.setStyleSheet("""
+            QListWidget { background: rgba(33,31,43,100); border: 1px solid #48424f;
+                          border-radius: 2px; outline: none; }
+            QListWidget::item { padding: 7px 9px; border-bottom: 1px solid #34303f; }
+            QListWidget::item:selected { background: #55454c; color: #f0e2d6; }
+            QListWidget::item:hover:!selected { background: #3a3345; }
+        """)
         self.roi_list.itemSelectionChanged.connect(self._on_roi_selection_changed)
         self.roi_list.itemChanged.connect(self._on_roi_item_changed)
+        self.roi_list.itemDoubleClicked.connect(lambda _: self._rename_selected_roi())
         roi_layout.addWidget(self.roi_list)
+        hint = QLabel("Right-click for ROI actions. Double-click to rename.")
+        hint.setStyleSheet("color: #b5acbf; font-size: 10px;")
+        roi_layout.addWidget(hint)
 
-        row_edit = QHBoxLayout()
-        self.btn_rename_roi = QPushButton("Rename ROI")
-        self.btn_rename_roi.clicked.connect(self._rename_selected_roi)
-        row_edit.addWidget(self.btn_rename_roi)
-
-        self.btn_set_roi_color = QPushButton("Set ROI Color")
-        self.btn_set_roi_color.clicked.connect(self._set_selected_roi_color)
-        row_edit.addWidget(self.btn_set_roi_color)
-        roi_layout.addLayout(row_edit)
-
-        row_color = QHBoxLayout()
-        self.btn_cycle_roi_color = QPushButton("Next Palette Color")
-        self.btn_cycle_roi_color.clicked.connect(self._cycle_selected_roi_color)
-        row_color.addWidget(self.btn_cycle_roi_color)
-        roi_layout.addLayout(row_color)
-
-        row_manage = QHBoxLayout()
-        self.btn_duplicate_roi = QPushButton("Duplicate ROI")
-        self.btn_duplicate_roi.clicked.connect(self._duplicate_selected_roi)
-        row_manage.addWidget(self.btn_duplicate_roi)
-
-        self.btn_export_roi = QPushButton("Export selected ROI CSV")
+        self.chk_show_rois = QAction("Show ROI overlays", self)
+        self.chk_show_rois.setCheckable(True)
+        self.chk_show_rois.setChecked(True)
+        self.chk_show_rois.toggled.connect(self._on_toggle_roi_overlays)
+        for attribute, title, callback in (
+            ("btn_add_roi", "Add ROI", self._add_roi_from_candidate),
+            ("btn_clear_candidate", "Clear selection", self._clear_candidate_roi),
+            ("btn_rename_roi", "Rename", self._rename_selected_roi),
+            ("btn_set_roi_color", "Set color", self._set_selected_roi_color),
+            ("btn_cycle_roi_color", "Next palette color", self._cycle_selected_roi_color),
+            ("btn_duplicate_roi", "Duplicate ROI", self._duplicate_selected_roi),
+            ("btn_export_roi", "Export ROI CSV", self._export_selected_roi_csv),
+            ("btn_toggle_analysis", "Open ROI Analysis", self._toggle_analysis_panel),
+            ("btn_delete_roi", "Delete ROI", self._delete_selected_roi),
+            ("btn_clear_all_rois", "Clear all ROIs", self._clear_all_rois),
+        ):
+            action = QAction(title, self)
+            action.triggered.connect(callback)
+            setattr(self, attribute, action)
+        self.btn_add_roi.setEnabled(False)
         self.btn_export_roi.setEnabled(False)
-        self.btn_export_roi.clicked.connect(self._export_selected_roi_csv)
-        row_manage.addWidget(self.btn_export_roi)
-        roi_layout.addLayout(row_manage)
-
-        row_analysis = QHBoxLayout()
-        self.btn_toggle_analysis = QPushButton("Open ROI Analysis")
         self.btn_toggle_analysis.setEnabled(False)
-        self.btn_toggle_analysis.clicked.connect(self._toggle_analysis_panel)
-        row_analysis.addWidget(self.btn_toggle_analysis)
-        roi_layout.addLayout(row_analysis)
-
-        row = QHBoxLayout()
-        self.btn_delete_roi = QPushButton("Delete selected")
-        self.btn_delete_roi.clicked.connect(self._delete_selected_roi)
-        row.addWidget(self.btn_delete_roi)
-
-        self.btn_clear_all_rois = QPushButton("Clear all")
-        self.btn_clear_all_rois.clicked.connect(self._clear_all_rois)
-        row.addWidget(self.btn_clear_all_rois)
-        roi_layout.addLayout(row)
+        for target in (roi_box, self.roi_list, self.view, self.compare_view):
+            target.setContextMenuPolicy(Qt.CustomContextMenu)
+            target.customContextMenuRequested.connect(
+                lambda pos, source=target: self._show_roi_context_menu(source, pos)
+            )
 
         self.middle_panel.addWidget(roi_box)
 
@@ -414,69 +408,44 @@ class MainWindow(QMainWindow):
         slice_layout = QVBoxLayout(slice_box)
         slice_layout.setSpacing(6)
 
-        self.slice_hint = QLabel("Save current time window (and optional active ROI).")
-        self.slice_hint.setWordWrap(True)
-        slice_layout.addWidget(self.slice_hint)
-
-        self.btn_add_slice = QPushButton("Add slice from current view")
-        self.btn_add_slice.setEnabled(False)
-        self.btn_add_slice.clicked.connect(self._add_slice_from_current_view)
-        slice_layout.addWidget(self.btn_add_slice)
-
         self.slice_list = QListWidget()
-        self.slice_list.setMinimumHeight(140)
+        self.slice_list.setAccessibleName("Saved slices")
+        self.slice_list.setMinimumHeight(160)
+        self.slice_list.setSpacing(1)
+        self.slice_list.setStyleSheet(self.roi_list.styleSheet())
         self.slice_list.itemSelectionChanged.connect(self._on_slice_selection_changed)
         self.slice_list.itemDoubleClicked.connect(self._jump_to_selected_slice)
         slice_layout.addWidget(self.slice_list)
-        edit_bounds = QPushButton("Use exact current interval for selected slice")
-        edit_bounds.clicked.connect(self._edit_slice_bounds)
-        slice_layout.addWidget(edit_bounds)
-        self.slice_stats = QLabel("Select a slice to inspect its saved interval.")
+        self.slice_stats = QLabel("Select a slice to see its details.")
         self.slice_stats.setWordWrap(True)
         slice_layout.addWidget(self.slice_stats)
+        slice_help = QLabel("Right-click here or the time bar for slice actions.")
+        slice_help.setStyleSheet("color: #b5acbf; font-size: 10px;")
+        slice_layout.addWidget(slice_help)
 
-        slice_edit_row = QHBoxLayout()
-        self.btn_rename_slice = QPushButton("Rename Slice")
-        self.btn_rename_slice.setEnabled(False)
-        self.btn_rename_slice.clicked.connect(self._rename_selected_slice)
-        slice_edit_row.addWidget(self.btn_rename_slice)
-
-        self.btn_set_slice_color = QPushButton("Set Slice Color")
-        self.btn_set_slice_color.setEnabled(False)
-        self.btn_set_slice_color.clicked.connect(self._set_selected_slice_color)
-        slice_edit_row.addWidget(self.btn_set_slice_color)
-        slice_layout.addLayout(slice_edit_row)
-
-        slice_loop_row = QHBoxLayout()
-        self.btn_loop_slice = QPushButton("Loop Selected Slice")
-        self.btn_loop_slice.setEnabled(False)
-        self.btn_loop_slice.clicked.connect(self._toggle_loop_selected_slice)
-        slice_loop_row.addWidget(self.btn_loop_slice)
-        slice_layout.addLayout(slice_loop_row)
-
-        slice_row = QHBoxLayout()
-        self.btn_jump_slice = QPushButton("Jump to slice")
-        self.btn_jump_slice.setEnabled(False)
-        self.btn_jump_slice.clicked.connect(self._jump_to_selected_slice)
-        slice_row.addWidget(self.btn_jump_slice)
-
-        self.btn_export_slice = QPushButton("Export slice CSV")
-        self.btn_export_slice.setEnabled(False)
-        self.btn_export_slice.clicked.connect(self._export_selected_slice_csv)
-        slice_row.addWidget(self.btn_export_slice)
-        slice_layout.addLayout(slice_row)
-
-        slice_row2 = QHBoxLayout()
-        self.btn_delete_slice = QPushButton("Delete slice")
-        self.btn_delete_slice.setEnabled(False)
-        self.btn_delete_slice.clicked.connect(self._delete_selected_slice)
-        slice_row2.addWidget(self.btn_delete_slice)
-
-        self.btn_clear_slices = QPushButton("Clear slices")
-        self.btn_clear_slices.setEnabled(False)
-        self.btn_clear_slices.clicked.connect(self._clear_slices)
-        slice_row2.addWidget(self.btn_clear_slices)
-        slice_layout.addLayout(slice_row2)
+        for attribute, title, callback in (
+            ("btn_add_slice", "Add slice from current view", self._add_slice_from_current_view),
+            ("btn_edit_slice_bounds", "Use current interval for selected slice", self._edit_slice_bounds),
+            ("btn_rename_slice", "Rename", self._rename_selected_slice),
+            ("btn_set_slice_color", "Set color", self._set_selected_slice_color),
+            ("btn_loop_slice", "Loop selected slice", self._toggle_loop_selected_slice),
+            ("btn_jump_slice", "Jump to slice", self._jump_to_selected_slice),
+            ("btn_export_slice", "Export slice CSV", self._export_selected_slice_csv),
+            ("btn_delete_slice", "Delete slice", self._delete_selected_slice),
+            ("btn_clear_slices", "Clear slices", self._clear_slices),
+        ):
+            action = QAction(title, self)
+            action.setEnabled(False)
+            action.triggered.connect(callback)
+            setattr(self, attribute, action)
+        self.btn_delete_slice.setShortcut(Qt.Key_Delete)
+        self.btn_delete_slice.setShortcutContext(Qt.WidgetShortcut)
+        self.slice_list.addAction(self.btn_delete_slice)
+        for target in (slice_box, self.slice_list):
+            target.setContextMenuPolicy(Qt.CustomContextMenu)
+            target.customContextMenuRequested.connect(
+                lambda pos, source=target: self._show_slice_context_menu(source, pos)
+            )
 
         self.middle_panel.addWidget(slice_box)
 
@@ -507,22 +476,47 @@ class MainWindow(QMainWindow):
         self.analysis_panel = ROIAnalysisPanel()
         self.analysis_panel.closeRequested.connect(self._hide_analysis_panel)
         self.analysis_panel.setVisible(False)
+        self.analysis_panel.seekRequested.connect(self._seek_from_plot)
+        self.analysis_panel.intervalRequested.connect(
+            lambda start, end: self._slice_from_plot(start, end, self.analysis_panel._plot_window.slice_context)
+        )
         top.addWidget(self.analysis_panel, stretch=2)
 
         # -------------------------
         # Bottom controls
         # -------------------------
+        from .recording_overview import RecordingOverview
+        self.recording_overview = RecordingOverview()
+        self.recording_overview.seekRequested.connect(self._seek_from_plot)
+        preview_row = QHBoxLayout()
+        self.import_notice = QLabel()
+        self.import_notice.setWordWrap(True)
+        self.full_recording_button = QPushButton("Load full recording")
+        self.full_recording_button.clicked.connect(self._load_full_recording)
+        preview_row.addWidget(self.import_notice, 1)
+        preview_row.addWidget(self.full_recording_button)
+        self.import_notice.hide()
+        self.full_recording_button.hide()
+        root.addLayout(preview_row)
+        root.addWidget(self.recording_overview)
         controls = QHBoxLayout()
         controls.setSpacing(10)
         root.addLayout(controls)
 
-        self.play_btn = QPushButton("Play")
+        from .ui_icons import StudioButton
+        self.play_btn = StudioButton("Play")
         self.play_btn.setEnabled(False)
         self.play_btn.clicked.connect(self._toggle_play)
         controls.addWidget(self.play_btn)
 
         controls.addWidget(QLabel("Time"))
         self.timeline = TimelineSlider(Qt.Horizontal)
+        self.recording_overview.timeline = self.timeline
+        self.timeline.addAction(self.btn_delete_slice)
+        self.timeline.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.timeline.customContextMenuRequested.connect(
+            lambda pos: self._show_slice_context_menu(self.timeline, pos)
+        )
         self.timeline.setRange(0, 1_000_000)
         self.timeline.setValue(0)
         self.timeline.setEnabled(False)
@@ -541,9 +535,18 @@ class MainWindow(QMainWindow):
         self.window_ms.setRange(0.001, 1_000_000_000)
         self.window_ms.setValue(50)
         self.window_ms.setSuffix(" ms")
+        self.window_ms.setToolTip("Events accumulated in each frame. Shorter windows reduce motion trails; 20 ms is a useful starting point. This is separate from saved slice length.")
         self.window_ms.setEnabled(False)
         self.window_ms.valueChanged.connect(self._on_window_changed)
         controls.addWidget(self.window_ms)
+        self.short_frame_btn = QPushButton("20 ms frame")
+        self.short_frame_btn.setToolTip("Reset the frame window to 20 ms to reduce motion trails.")
+        self.short_frame_btn.clicked.connect(lambda: self.window_ms.setValue(20))
+        controls.addWidget(self.short_frame_btn)
+
+        from .timeline_notes import TimelineNotes
+        self.timeline_notes = TimelineNotes(self)
+        root.addWidget(self.timeline_notes)
 
         precise = QHBoxLayout()
         root.addLayout(precise)
@@ -565,26 +568,35 @@ class MainWindow(QMainWindow):
         precise.addWidget(self.step_us)
         for label, delta, shortcut in (("Step back", -1, "Left"), ("Step forward", 1, "Right")):
             button = QPushButton(label)
+            from .ui_icons import icon
+            button.setIcon(icon("skip-back" if delta < 0 else "skip-forward", "#e2dfe7"))
+            button.setIconSize(QSize(18, 18))
+            button.setToolTip(f"Move {'backward' if delta < 0 else 'forward'} by the µs / tick amount. Keyboard: {shortcut} arrow.")
+            if delta < 0:
+                self.step_back_button = button
+            else:
+                self.step_forward_button = button
             button.clicked.connect(lambda checked=False, d=delta: self._step(d))
             precise.addWidget(button)
             action = QAction(label, self)
             action.setShortcut(shortcut)
             action.triggered.connect(lambda checked=False, d=delta: self._step(d))
             self.addAction(action)
-        for label, handler in (("Zoom to interval", self._zoom_interval), ("Full timeline", self._zoom_full)):
-            button = QPushButton(label)
-            button.clicked.connect(handler)
-            precise.addWidget(button)
-
         # -------------------------
         # Menu
         # -------------------------
         file_menu = self.menuBar().addMenu("&File")
+        self._recording_file_actions = []
+        file_menu.aboutToShow.connect(self._update_file_menu_actions)
 
-        import_action = QAction("Import .dat", self)
-        import_action.triggered.connect(self.on_import_dat_clicked)
+        import_action = QAction("Open recording…", self)
+        import_action.triggered.connect(self._open_recording)
+        import_action.setShortcut("Ctrl+O")
         file_menu.addAction(import_action)
-        for label, handler in (("Open CSV / H5", self._open_recording),
+        self.load_full_action = file_menu.addAction("Load full recording")
+        self.load_full_action.triggered.connect(self._load_full_recording)
+        self.load_full_action.setEnabled(False)
+        for label, handler in (
                                ("Export full recording CSV", self._export_full),
                                ("Export current selection CSV", self._export_current),
                                ("Save Session As…", self._save_session_as),
@@ -592,32 +604,93 @@ class MainWindow(QMainWindow):
             action = QAction(label, self)
             action.triggered.connect(handler)
             file_menu.addAction(action)
+            if handler in (self._export_full, self._export_current, self._save_session_as):
+                self._recording_file_actions.append(action)
         sensor_action = QAction("Set sensor resolution…", self)
         sensor_action.triggered.connect(self._set_sensor_resolution)
         file_menu.addAction(sensor_action)
+        self._recording_file_actions.append(sensor_action)
 
         save_project_action = QAction("Save Project", self)
         save_project_action.setShortcut("Ctrl+S")
         save_project_action.triggered.connect(self.save_project)
         file_menu.addAction(save_project_action)
+        self._recording_file_actions.append(save_project_action)
+
+        bundle_action = file_menu.addAction("Export project…")
+        bundle_action.triggered.connect(self._export_project_bundle)
+        self._recording_file_actions.append(bundle_action)
 
         rename_project_action = QAction("Rename Project", self)
         rename_project_action.triggered.connect(self.rename_current_project)
         file_menu.addAction(rename_project_action)
+        self._rename_project_action = rename_project_action
 
         file_menu.addSeparator()
 
-        reset_action = QAction("Reset View", self)
+        reset_action = QAction("Refresh View", self)
+        reset_action.setToolTip("Redraw the recording and show the full timeline. Keep all project work and display settings.")
         reset_action.triggered.connect(self._reset_view)
         file_menu.addAction(reset_action)
+        self._recording_file_actions.append(reset_action)
+        self._update_file_menu_actions()
+        view_menu = self.menuBar().addMenu("&View")
+        timeline_menu = view_menu.addMenu("Timeline")
+        for label, handler in (("Zoom to window", self._zoom_interval), ("Reset timeline zoom", self._zoom_full)):
+            action = timeline_menu.addAction(label)
+            action.setToolTip("Changes the time slider's navigation range, without changing playback window duration.")
+            action.triggered.connect(handler)
+            self._recording_file_actions.append(action)
+        view_menu.aboutToShow.connect(self._update_file_menu_actions)
+
         analysis_menu = self.menuBar().addMenu("&Analysis")
         analysis_action = QAction("Advanced Analysis…", self)
         analysis_action.setShortcut("Ctrl+Shift+A")
         analysis_action.triggered.connect(self._open_analysis_workspace)
         analysis_menu.addAction(analysis_action)
+        self._recording_analysis_actions = [analysis_action]
+        analysis_menu.aboutToShow.connect(self._update_file_menu_actions)
         live_action = QAction("Live camera…",self)
         live_action.triggered.connect(self._open_live_window)
         analysis_menu.addAction(live_action)
+        for label, handler in (("Compare ROI activity", self._compare_roi_activity),
+                               ("Recording quality diagnostics", self._open_quality_diagnostics),
+                               ("Batch analyze recordings", self._open_batch_analysis)):
+            action = analysis_menu.addAction(label)
+            action.triggered.connect(handler)
+            self._recording_analysis_actions.append(action)
+        edit_menu = self.menuBar().addMenu("&Edit")
+        self.undo_action = edit_menu.addAction("Undo")
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.redo_action = edit_menu.addAction("Redo")
+        self.redo_action.setShortcuts(["Ctrl+Shift+Z", "Ctrl+Y"])
+        self.edit_history = EditHistory(self)
+        self.undo_action.triggered.connect(self.edit_history.undo)
+        self.redo_action.triggered.connect(self.edit_history.redo)
+        self.edit_history.clear()
+        for viewer in (self.view, self.compare_view):
+            viewer.editStarted.connect(lambda: self.edit_history.begin_gesture("Move / resize ROI"))
+            viewer.editFinished.connect(self.edit_history.end_gesture)
+        self.timeline.editStarted.connect(lambda: self.edit_history.begin_gesture("Move / resize slice"))
+        self.timeline.editFinished.connect(self.edit_history.end_gesture)
+
+        from .about import show_about
+        self.menuBar().addMenu("&Help").addAction("About, licenses and privacy", lambda: show_about(self))
+        from .window_chrome import StudioHeader
+        self._studio_menu_bar = self.menuBar()
+        self.studio_header = StudioHeader(self, self._studio_menu_bar, show_appearance=True)
+        self.setMenuWidget(self.studio_header)
+        from .theme import appearance_controller
+        self._original_list_style = self.roi_list.styleSheet()
+        appearance_controller().changed.connect(self._apply_studio_appearance)
+        self._apply_studio_appearance()
+
+        self._autosave_baseline = None
+        self._last_autosave_digest = None
+        self._recovery_revision = None
+        self.autosave_status = QLabel("Saves automatically on close")
+        self.autosave_status.setToolTip("Closing the editor saves the project, thumbnail and animated preview. Ctrl+S saves at any time.")
+        self.statusBar().addPermanentWidget(self.autosave_status)
 
         self.statusBar().showMessage("Ready")
         self._update_window_title()
@@ -629,13 +702,27 @@ class MainWindow(QMainWindow):
     # =========================================================
     # General helpers
     # =========================================================
+    def _update_file_menu_actions(self):
+        loaded = self.events is not None
+        partial = loaded and not self.events.metadata.get("complete", True)
+        self.load_full_action.setEnabled(partial)
+        self.import_notice.setVisible(partial)
+        self.full_recording_button.setVisible(partial)
+        if partial:
+            self.import_notice.setText(f"Preview: first {len(self.events.t):,} events. Load the full recording before exporting data or a project bundle.")
+        for action in self._recording_file_actions:
+            action.setEnabled(loaded)
+        self._rename_project_action.setEnabled(self.current_project_dir is not None)
+        for action in getattr(self, "_recording_analysis_actions", []):
+            action.setEnabled(loaded)
+
     def _run_task(self, function, finished, message="Working…", cooperative=False) -> None:
         if self._task is not None:
             return
         if self.is_playing:
             self._toggle_play()
         self.centralWidget().setEnabled(False)
-        self.menuBar().setEnabled(False)
+        self._studio_menu_bar.setEnabled(False)
         self.statusBar().showMessage(message)
         dialog = QProgressDialog(message, "Cancel" if cooperative else "", 0, 100 if cooperative else 0, self)
         dialog.setWindowTitle("Event-Based Studio")
@@ -659,7 +746,7 @@ class MainWindow(QMainWindow):
 
         def cleanup():
             self.centralWidget().setEnabled(True)
-            self.menuBar().setEnabled(True)
+            self._studio_menu_bar.setEnabled(True)
             self._task = None
             dialog.close()
             dialog.deleteLater()
@@ -699,8 +786,86 @@ class MainWindow(QMainWindow):
         if self._workspace is None:
             self._workspace = AnalysisWorkspace(self)
         self._workspace.restore_settings()
+        self._workspace.use_full_interval()
         self._workspace.show()
         self._workspace.raise_()
+
+    def _analyze_selected_slice(self):
+        row = self.slice_list.currentRow()
+        if self.events is None or not 0 <= row < len(self.slices):
+            return
+        item = self.slices[row]
+        self._open_analysis_workspace()
+        self._workspace.start.setText(str(item.t0))
+        self._workspace.end.setText(str(item.t1))
+        self._workspace.description.setText(f'Analyzing slice: {item.name}. Choose a tab, then click Run analysis.')
+
+    def _compare_roi_activity(self):
+        if self.events is None:
+            return
+        if not self.rois:
+            QMessageBox.information(self, "Compare ROIs", "Create at least one ROI first.")
+            return
+        self._open_analysis_workspace()
+        self._workspace.scope.setCurrentText("All ROIs")
+        self._workspace.normalize.setChecked(True)
+        self._workspace.use_full_interval()
+        self._workspace.tabs.setCurrentIndex(0)
+        self._workspace.run_analysis()
+
+    def _open_batch_analysis(self):
+        if self.events is None:
+            QMessageBox.information(self, "Batch analysis", "Load a reference recording to set analysis parameters first.")
+            return
+        self._open_analysis_workspace()
+        self._workspace.tabs.setCurrentIndex(self._workspace.tabs.count() - 1)
+
+    def _open_quality_diagnostics(self):
+        if self.events is None:
+            return
+        from .quality_diagnostics import QualityDialog
+        if not hasattr(self, "_quality_dialog"):
+            self._quality_dialog = QualityDialog(self)
+        self._quality_dialog.show()
+        self._quality_dialog.raise_()
+        self._quality_dialog.run()
+
+    def _recording_tools_changed(self, events):
+        self.recording_overview.set_recording(events)
+        dialog = getattr(self, "_quality_dialog", None)
+        if dialog is not None:
+            dialog.close()
+            dialog.report = None
+            dialog.export_button.setEnabled(False)
+            dialog.hot_table.setRowCount(0)
+            dialog.gap_table.setRowCount(0)
+            dialog.summary.setText("Run diagnostics for the current recording.")
+
+    @record_edit("Add slice from graph")
+    def _slice_from_plot(self, start, end, context=None):
+        if self.events is None:
+            return
+        start = max(self.t_min, int(start))
+        end = min(self.t_max + 1, int(end))
+        if end <= start:
+            return
+        if context and context.get("source_sha256") != self.events.metadata.get("sha256"):
+            QMessageBox.warning(self, "Source changed", "Run the graph again for the current recording.")
+            return
+        count = len(self.slices)
+        self._add_slice_from_current_view(bounds=(start, end))
+        if len(self.slices) > count:
+            self._seek_from_plot(start)
+        if context is not None and len(self.slices) > count:
+            item = self.slices[-1]
+            item.polarity = context.get("polarity", "both")
+            item.filters = dict(context.get("filters", {}))
+            item.roi_snapshot = deepcopy(context.get("roi_snapshot"))
+            item.roi_id = context.get("roi_id")
+            item.roi_index = next((i for i, roi in enumerate(self.rois) if roi.id == item.roi_id), None)
+            self._rebuild_slice_list()
+            self.slice_list.setCurrentRow(len(self.slices) - 1)
+            self._update_timeline_slice_regions()
 
     def _open_live_window(self):
         from .live_window import show_live_camera
@@ -728,23 +893,69 @@ class MainWindow(QMainWindow):
 
     def _open_recording(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open recording", str(self.data_dir),
-                                             "Event recordings (*.csv *.h5)")
+                                             "Event recordings (*.dat *.csv *.h5 *.hdf5)")
         if not path:
             return
+        preview = False
+        if Path(path).stat().st_size > 32 * 1024 * 1024:
+            choice = QMessageBox(self)
+            choice.setWindowTitle("Open large recording")
+            choice.setText("Start with a quick preview or load the complete recording?")
+            choice.setInformativeText("Quick preview reads the first 2 million events. Full loading can take several minutes. You can load the rest afterward.")
+            quick = choice.addButton("Quick preview", QMessageBox.AcceptRole)
+            full = choice.addButton("Load full recording", QMessageBox.ActionRole)
+            choice.addButton(QMessageBox.Cancel)
+            choice.setDefaultButton(quick)
+            choice.exec()
+            if choice.clickedButton() not in (quick, full):
+                return
+            preview = choice.clickedButton() is quick
+        self._open_recording_path(path, preview=preview)
 
-        def load():
-            source = Path(path)
-            if source.suffix.lower() == ".h5":
-                source = h5_to_csv_windows(source, self.data_dir / "converted" / uuid4().hex[:12] / (source.stem + ".csv"))
-            events = load_events_from_csv(source)
-            if Path(path).suffix.lower() == ".h5":
-                from .science import fingerprint
-                events.metadata.update({"original_path": path, "original_sha256": fingerprint(Path(path)),
-                                        "conversion": "OpenEB H5 → CSV"})
-            return source, events
+    def _open_recording_path(self, path, *, preview=False):
+        from .recording_import import load_recording
+        def load(cancel, progress):
+            result = load_recording(path, self.data_dir, preview=preview, cancel=cancel, progress=progress)
+            if getattr(self, 'current_project_dir', None) is not None:
+                self._update_import_preview(result[1])
+            return result
 
         self._run_task(load, lambda result: self._load_csv_into_app(result[0], Path(path).stem,
-                                                                   prepared_events=result[1]), "Loading full recording…")
+                                                                   prepared_events=result[1]), "Opening preview…" if preview else "Opening recording…", cooperative=True)
+
+    def _load_full_recording(self):
+        if self.events is None or self.events.metadata.get("complete", True):
+            return
+        from .recording_import import load_recording
+        from .filters import apply_filters
+        snapshot = deepcopy(self._build_session_dict())
+        previous_hash = self.events.metadata.get("sha256")
+        input_hash = self.events.metadata.get("input_sha256")
+        path = self.events.metadata.get("input_path", self.loaded_csv_path)
+
+        def prepare(cancel, progress):
+            source, events = load_recording(path, self.data_dir, cancel=cancel, progress=progress)
+            if input_hash and events.metadata.get("input_sha256") != input_hash:
+                raise ValueError("The original recording changed since this preview. Open it as a new recording; your current preview has been kept.")
+            if not events.metadata.get("complete"):
+                raise ValueError("This file is itself a partial preview. Locate and open the original full recording.")
+            filtered = apply_filters(events, snapshot.get("filters", {}), cancel, progress)
+            return source, events, filtered
+
+        def complete(result):
+            source, events, filtered = result
+            snapshot["source"].update(csv_path=str(source), metadata=events.metadata)
+            for item in snapshot.get("slices", []) + snapshot.get("annotations", []) + snapshot.get("detections", []):
+                if item.get("source_sha256") == previous_hash:
+                    item["source_sha256"] = events.metadata["sha256"]
+            snapshot["view"].update(zoom_start=int(events.t[0]), zoom_end=int(events.t[-1]) + 1, is_playing=False)
+            self._restore_session(snapshot, (events, filtered))
+
+        self._run_task(prepare, complete, "Loading full recording…", cooperative=True)
+
+    def _load_cached_csv(self, path):
+        from .recording_import import load_recording
+        return load_recording(path, self.data_dir)[1]
 
     def _seek(self, timestamp: int) -> None:
         if self.events is None:
@@ -752,7 +963,24 @@ class MainWindow(QMainWindow):
         self.position_us = max(self.t_min, min(self.t_max, int(timestamp)))
         self._render_from_ui()
 
+    def _seek_from_plot(self, timestamp):
+        if self.is_playing:
+            self._toggle_play()
+        self._seek(timestamp)
+
     def _sync_time_widgets(self) -> None:
+        if self.events is not None:
+            # Keep off-screen seeks (including playback and saved slices) visible
+            # in both controls instead of pinning just the slider to an edge.
+            span = max(1, self.zoom_end - self.zoom_start)
+            if self.position_us < self.zoom_start:
+                self.zoom_start = self.position_us
+                self.zoom_end = min(self.t_max + 1, self.zoom_start + span)
+            elif self.position_us >= self.zoom_end:
+                self.zoom_end = min(self.t_max + 1, self.position_us + 1)
+                self.zoom_start = max(self.t_min, self.zoom_end - span)
+        self.recording_overview.set_visible_range(self.zoom_start, self.zoom_end)
+        self.recording_overview.set_interval(self.position_us, self.position_us + self.duration_us)
         self.timeline.blockSignals(True)
         self.timeline.setValue(self._time_us_to_slider_value(self.position_us))
         self.timeline.blockSignals(False)
@@ -806,9 +1034,8 @@ class MainWindow(QMainWindow):
     def _update_mode_description(self) -> None:
         mode = self.current_view_mode
         inherited=self.events is not None and self.events.metadata.get('classification')=='DERIVED'
-        classification = "RAW" if mode == VIEW_MODE_RAW and not inherited else "STYLIZED" if mode == VIEW_MODE_GLOW else "DERIVED"
-        self.view_box.setTitle(f"{classification} • {mode}")
-        self.compare_box.setTitle('DERIVED • unfiltered loaded file' if inherited else 'RAW • unfiltered reference')
+        self.view_box.setTitle(mode + (" (processed recording)" if inherited else ""))
+        self.compare_box.setTitle("Unfiltered view")
         for widget in (self.persistence_label, self.persistence_ms):
             widget.setVisible(mode == VIEW_MODE_PERSISTENCE)
         for widget in (self.glow_label, self.glow_intensity):
@@ -822,19 +1049,30 @@ class MainWindow(QMainWindow):
             packed = batch.y.astype(np.int64) * self.hw[1] + batch.x
             self._heat_peak = int(np.bincount(packed).max()) if len(packed) else 0
         descriptions = {
-            VIEW_MODE_RAW: "RAW • real event presence; no intensity normalization. + orange, − blue, both white.",
-            VIEW_MODE_HEATMAP: f"DERIVED • {self.heat_scale.currentText()}; black = 0, red → yellow → white = increasing density. Window peak: {getattr(self, '_heat_peak', 0)} events/pixel. Relative scales map peak to white; absolute white = 100.",
-            VIEW_MODE_PERSISTENCE: "DERIVED • latest real event per polarity/pixel, linear decay to zero over the persistence duration, ending at the interval's exclusive end.",
-            VIEW_MODE_GLOW: "STYLIZED • polarity presence plus a 5×5 spatial halo. Halo pixels are styling, not additional events.",
-            VIEW_MODE_TRAIL: "DERIVED • legacy time-colored accumulation in this interval; logarithmic scaling and relative normalization. No fading decay.",
-            VIEW_MODE_MOTION_ARROWS: "DERIVED • local polarity-separated log-count pattern matching between the two half-windows. Only textured, unique, reverse-consistent matches are drawn; no arrow means motion is unresolved or stationary. Search limit = half the spacing. Display × changes glyph length only. Not calibrated optical flow.",
+            VIEW_MODE_RAW: "Shows events in the selected time window. Orange marks increases in brightness, blue marks decreases, and white marks pixels with both.",
+            VIEW_MODE_HEATMAP: f"Shows how many events occurred at each pixel. Brighter colors mean more events. The highest count in this window is {getattr(self, '_heat_peak', 0):,} events at one pixel.",
+            VIEW_MODE_PERSISTENCE: "Shows recent events and fades them over the selected time. Older events appear darker.",
+            VIEW_MODE_GLOW: "Adds a soft glow around the events. The glow is a visual effect and does not add recorded events.",
+            VIEW_MODE_TRAIL: "Colors events by when they occurred in the selected time window. A longer window shows a longer movement trail.",
+            VIEW_MODE_MOTION_ARROWS: "Arrows show the estimated direction and distance that nearby event patterns move during this frame. Arrow spacing controls detail; match strictness hides weaker estimates. Arrow length and background brightness change appearance only.",
         }
-        prefix = "DERIVED filtered view: " + str(self.filter_settings) + "\n" if self.filtered_events is not None else ""
+        details = {
+            VIEW_MODE_RAW: "Each pixel shows whether positive events, negative events, or both occurred. Brightness is not scaled by event count.",
+            VIEW_MODE_HEATMAP: "Black means zero events. Relative scales map the largest count to white. On the absolute scale, white means 100 events per pixel.",
+            VIEW_MODE_PERSISTENCE: "The latest event for each polarity at each pixel fades linearly over the persistence duration, measured at the end of the selected interval.",
+            VIEW_MODE_GLOW: "A five-by-five-pixel halo is added around event pixels for display only.",
+            VIEW_MODE_TRAIL: "Event times determine color. Counts use logarithmic scaling and relative normalization. This mode does not fade events over time.",
+            VIEW_MODE_MOTION_ARROWS: "Pattern matching uses polarity-separated event counts. Matches must pass texture, uniqueness and reverse-consistency checks. Missing arrows can mean stationary motion or an unresolved estimate. Search distance is limited to half the arrow spacing. These estimates are not calibrated optical flow or speed measurements.",
+        }
+        prefix = "Filters are applied to this view. Your original recording is unchanged.\n" if self.filtered_events is not None else ""
         if inherited:
-            prefix='Loaded file has DERIVED processing provenance; original acquisition events are not reconstructed.\n'+prefix
+            prefix='This file contains previously processed events.\n'+prefix
         if self.filtered_events is not None:
-            self.view_box.setTitle("DERIVED filtered | " + mode)
-        self.view_mode_hint.setText(prefix + descriptions[mode] + "\nPolarity filter: " + self.polarity_combo.currentText())
+            self.view_box.setTitle(mode + " (filtered)")
+        showing = {"both": "Showing all events.", "pos": "Showing increases in brightness only.",
+                   "neg": "Showing decreases in brightness only."}
+        self.view_mode_hint.setText(prefix + descriptions[mode] + "\n" + showing[self.polarity_combo.currentText()])
+        self.view_mode_hint.setToolTip(details[mode])
 
     def _update_probe_table(self, t0, t1) -> None:
         self.roi_table.setRowCount(len(self.rois))
@@ -848,7 +1086,7 @@ class MainWindow(QMainWindow):
     def _update_slice_stats(self) -> None:
         row = self.slice_list.currentRow()
         if self.events is None or not (0 <= row < len(self.slices)):
-            self.slice_stats.setText("Select a slice to inspect its saved interval.")
+            self.slice_stats.setText("Select a slice to see its details.")
             return
         item = self.slices[row]
         roi = Roi(**item.roi_snapshot) if item.roi_snapshot else None
@@ -865,12 +1103,14 @@ class MainWindow(QMainWindow):
         pos = int(np.sum(batch.p > 0))
         active = len(np.unique(batch.y.astype(np.int64) * self.hw[1] + batch.x))
         duration = item.t1 - item.t0
-        self.slice_stats.setText(f"Saved selection [{item.t0}, {item.t1}) µs | {duration} µs\n"
-                                 f"Polarity: {item.polarity} | Events: {count:,} | + / −: {pos:,} / {count-pos:,}\n"
-                                 f"{count / max(0.001, duration/1000):.4f} ev/ms | +/− ratio: {polarity_ratio(pos,count-pos):.4f} | Active pixels: {active:,}\n"
-                                 "ROI bounds are saved with the slice; later ROI edits do not change its export.")
+        showing = {"both": "All events", "pos": "Brightness increases", "neg": "Brightness decreases"}[item.polarity]
+        self.slice_stats.setText(f"Start: {item.t0:,} µs. End: {item.t1:,} µs (not included). Duration: {duration:,} µs.\n"
+                                 f"Showing: {showing.lower()}. Events: {count:,}. Positive: {pos:,}. Negative: {count-pos:,}.\n"
+                                 f"Events per millisecond: {count / max(0.001, duration/1000):.4f}. Positive-to-negative ratio: {polarity_ratio(pos,count-pos):.4f}. Active pixels: {active:,}."
+                                 + ("\nThe saved region stays the same when you edit other regions." if roi is not None else ""))
         self._slice_stats_cache = (cache_key, self.slice_stats.text())
 
+    @record_edit("Update slice interval")
     def _edit_slice_bounds(self) -> None:
         row = self.slice_list.currentRow()
         if self.events is not None and 0 <= row < len(self.slices):
@@ -880,6 +1120,7 @@ class MainWindow(QMainWindow):
             item.filters = self.filter_settings.copy()
             self._rebuild_slice_list()
             self.slice_list.setCurrentRow(row)
+            self._update_timeline_slice_regions()
 
     def _export_dialog(self, title, **selection) -> None:
         if self.events is None:
@@ -947,12 +1188,15 @@ class MainWindow(QMainWindow):
         if path:
             try:
                 session = json.loads(Path(path).read_text(encoding="utf-8"))
+                from .recovery import resolve_session_source
+                session = resolve_session_source(session, Path(path).parent)
                 self._restore_session(session)
             except Exception as exc:
                 QMessageBox.critical(self, "Session load failed", str(exc))
 
     def _update_window_title(self) -> None:
         from .version import __version__
+        self._update_file_menu_actions()
         self.setWindowTitle(f"Event-Based Studio {__version__} — {self.project_name}")
 
     def _next_default_roi_color(self) -> str:
@@ -993,6 +1237,19 @@ class MainWindow(QMainWindow):
         self.current_view_mode = mode
         self._render_from_ui()
 
+    def _apply_studio_appearance(self, *_):
+        from .theme import appearance_controller
+        glass = appearance_controller().mode == "glass"
+        style = """
+            QListWidget { background: rgba(6,19,31,110); border: 1px solid rgba(190,223,243,35);
+                          border-radius: 2px; outline: none; }
+            QListWidget::item { padding: 7px 9px; border-bottom: 1px solid rgba(190,223,243,18); }
+            QListWidget::item:selected { background: #30546a; color: #ecfaff; }
+            QListWidget::item:hover:!selected { background: rgba(151,218,239,25); }
+        """ if glass else self._original_list_style
+        self.roi_list.setStyleSheet(style)
+        self.slice_list.setStyleSheet(style)
+
     def closeEvent(self, event) -> None:
         if self._live_window is not None and self._live_window.parent() is self and self._live_window.is_busy():
             self._live_window.close()
@@ -1003,6 +1260,15 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.play_timer.stop()
+        self.edit_history.end_gesture()
+        if self.events is not None and self.loaded_csv_path:
+            try:
+                self._save_on_close()
+            except Exception as exc:
+                event.ignore()
+                QMessageBox.critical(self, "Project could not be saved",
+                    f"The project is still open because saving failed:\n{exc}\n\nTry again or use Save Project before closing.")
+                return
         if self.browser_ref is not None:
             self.browser_ref.refresh_projects()
             self.browser_ref.show()
@@ -1013,29 +1279,6 @@ class MainWindow(QMainWindow):
     # =========================================================
     # Data loading / saving
     # =========================================================
-    def on_import_dat_clicked(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Import DAT", str(Path.home()), "Event files (*.dat)")
-        if not path:
-            return
-        def convert_and_load():
-            out_dir = self.data_dir / "converted" / uuid4().hex[:12]
-            h5 = convert_dat_to_h5_windows(path, out_dir=out_dir)
-            csv_path = h5_to_csv_windows(h5, out_dir / (h5.stem + ".csv"))
-            events = load_events_from_csv(csv_path)
-            from .science import dat_resolution, fingerprint
-            dimensions = dat_resolution(path)
-            events.metadata.update({"original_path": path, "original_sha256": fingerprint(Path(path)),
-                                    "conversion": "OpenEB DAT → H5 → CSV"})
-            if "width" in dimensions and "height" in dimensions:
-                width, height = dimensions["width"], dimensions["height"]
-                if width <= int(events.x.max()) or height <= int(events.y.max()) or width * height > 16_777_216:
-                    raise ValueError("DAT sensor metadata conflicts with converted event coordinates.")
-                events.metadata.update({"resolution": [width, height], "resolution_origin": "DAT header"})
-            return csv_path, events
-        self._run_task(convert_and_load,
-                       lambda result: self._load_csv_into_app(result[0], Path(path).stem, prepared_events=result[1]),
-                       "Converting DAT → H5 → CSV and loading full recording…")
-
     def _load_csv_into_app(
         self,
         csv_path: Path,
@@ -1046,15 +1289,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Loading events from CSV…")
         QApplication.processEvents()
 
-        events = prepared_events if prepared_events is not None else load_events_from_csv(csv_path)
+        events = prepared_events if prepared_events is not None else self._load_cached_csv(csv_path)
         hw = infer_hw(events)
 
         self.events = events
+        self._recording_tools_changed(events)
         self.hw = hw
         self.t_min = int(events.t.min()) if events.t.size else 0
         self.t_max = int(events.t.max()) if events.t.size else 0
         self.loaded_name = loaded_name
         self.loaded_csv_path = str(csv_path)
+        self._autosave_baseline = None
+        self._last_autosave_digest = None
         self.position_us = self.t_min
         self.zoom_start, self.zoom_end = self.t_min, self.t_max + 1
         self.duration_us = min(50_000, self.t_max - self.t_min + 1)
@@ -1062,13 +1308,14 @@ class MainWindow(QMainWindow):
 
         if events.t.size == 0:
             QMessageBox.warning(self, "Empty", "CSV contains 0 events.")
-            self._reset_view()
+            self._clear_recording()
             return
 
         self.timeline.setEnabled(True)
         self.window_ms.setEnabled(True)
         self.play_btn.setEnabled(True)
         self.btn_add_slice.setEnabled(True)
+        self._update_file_menu_actions()
 
         self.is_playing = False
         self.play_timer.stop()
@@ -1101,9 +1348,24 @@ class MainWindow(QMainWindow):
         self._update_stats_global()
         self._update_timeline_slice_regions()
 
+        self.edit_history.clear()
         self.statusBar().showMessage(
             f"Loaded {len(events.t):,} events | {'Complete recording' if events.metadata.get('complete') else 'LIMITED PREVIEW'} | {hw[1]}x{hw[0]} ({events.metadata.get('resolution_origin')}) | {Path(csv_path).name}"
         )
+        if self.browser_ref is not None and self.current_project_dir is not None:
+            self.browser_ref.refresh_projects()
+
+    def _update_import_preview(self, events):
+        """Refresh browser artwork in the import worker without committing a session."""
+        if not events.t.size:
+            return
+        from .project_utils import save_recording_preview
+        hw = infer_hw(events)
+        start, end = int(events.t[0]), int(events.t[-1]) + 1
+        duration = min(50_000, end - start)
+        starts = np.linspace(start, max(start, end - duration), 10, dtype=np.int64)
+        frames = [rendering.render_frame(events, hw, int(t), duration, VIEW_MODE_RAW, {}) for t in starts]
+        save_recording_preview(self.current_project_dir, frames)
 
     def _roi_to_dict(self, roi_item: NamedROI) -> dict:
         return {
@@ -1201,6 +1463,8 @@ class MainWindow(QMainWindow):
         return frames
 
     def save_project(self) -> None:
+        if self._task is not None:
+            return
         if self.events is None or not self.loaded_csv_path:
             QMessageBox.warning(self, "Save Project", "Load a dataset before saving the project.")
             return
@@ -1208,7 +1472,8 @@ class MainWindow(QMainWindow):
             self.current_project_dir = create_project_dir(self.projects_root, self.loaded_name or "Untitled Project")
             self.project_name = self.current_project_dir.name
             self._update_window_title()
-        session = self._build_session_dict()
+        from .recovery import session_for_storage, session_digest, clear_recovery
+        session = session_for_storage(self._build_session_dict(), self.current_project_dir)
         thumb = self.current_frame.copy() if self.current_frame is not None else None
         events, hw, mode = self._display_events(), self.hw, self.current_view_mode
         parameters, duration = self._render_parameters(), self.duration_us
@@ -1220,10 +1485,52 @@ class MainWindow(QMainWindow):
             return directory
         def complete(result):
             self.current_session_path = str(session_json_path(result))
-            self.statusBar().showMessage(f"Project saved: {result}")
+            self._autosave_baseline = session_digest(session, result)
+            self._last_autosave_digest = None
+            warning = None
+            try:
+                clear_recovery(result, expected_revision=self._recovery_revision)
+                self._recovery_revision = None
+            except (OSError, ValueError) as exc:
+                warning = str(exc)
+            self.autosave_status.setText("Project saved; old snapshot kept" if warning else "Project saved")
+            self.statusBar().showMessage(f"Project saved; recovery snapshot kept: {warning}" if warning else f"Project saved: {result}", 15000)
             if self.browser_ref is not None:
                 self.browser_ref.refresh_projects()
         self._run_task(save, complete, "Saving session, thumbnail and previews...")
+
+    def _save_on_close(self):
+        """Commit the real project before accepting the window close event."""
+        from .recovery import session_for_storage, clear_recovery, recovery_revision
+        if self.current_project_dir is None:
+            self.current_project_dir = create_project_dir(self.projects_root, self.loaded_name or "Untitled Project")
+            self.project_name = self.current_project_dir.name
+        session = session_for_storage(self._build_session_dict(), self.current_project_dir)
+        thumb = self.current_frame.copy() if self.current_frame is not None else None
+        save_project_bundle(self.current_project_dir, self.project_name, session,
+                            thumb, self._generate_preview_frames())
+        self.current_session_path = str(session_json_path(self.current_project_dir))
+        if recovery_revision(self.current_project_dir) == self._recovery_revision:
+            clear_recovery(self.current_project_dir, expected_revision=self._recovery_revision)
+        self._recovery_revision = None
+
+    def _export_project_bundle(self):
+        if self.events is None or self._task is not None:
+            return
+        from .project_dialogs import choose_bundle_export
+        from .project_transfer import export_project
+        choice = choose_bundle_export(self, self.project_name, self.loaded_csv_path)
+        if choice is None:
+            return
+        destination, include_recording = choice
+        snapshot = deepcopy(self._build_session_dict())
+        directory = self.current_project_dir
+        self._run_task(
+            lambda cancel, progress: export_project(destination, snapshot, directory,
+                include_recording=include_recording, cancel=cancel, progress=progress),
+            lambda path: self.statusBar().showMessage(f"Project exported: {path}", 15000),
+            "Exporting project…", cooperative=True,
+        )
 
     def rename_current_project(self) -> None:
         if self.current_project_dir is None:
@@ -1264,12 +1571,22 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        from .recovery import read_recovery, clear_recovery, recovery_revision
+        self._recovery_revision = recovery_revision(self.current_project_dir)
+        # Older builds may have left unsaved work. Restore it once without a
+        # recovery workflow; closing now commits it as a normal project save.
+        try:
+            legacy = read_recovery(self.current_project_dir)
+        except ValueError:
+            legacy = None
+        if legacy:
+            self._restore_session(legacy["session"])
+            return
         if sess_path.exists():
             try:
                 with sess_path.open("r", encoding="utf-8") as f:
                     session = json.load(f)
-                self._restore_session(session)
-                self.current_session_path = str(sess_path)
+                self._restore_session(session, on_restored=lambda: setattr(self, "current_session_path", str(sess_path)))
             except Exception as e:
                 QMessageBox.warning(
                     self,
@@ -1277,20 +1594,30 @@ class MainWindow(QMainWindow):
                     f"Project opened, but session restore failed:\n{e}"
                 )
 
-    def _restore_session(self, session: dict, prepared_events=None) -> None:
+    def _restore_session(self, session: dict, prepared_events=None, *, on_restored=None) -> None:
         from .session_validation import validate_settings
         from .filters import apply_filters
         validate_settings(session)
         settings = session.get("filters", {})
         if prepared_events is None:
+            from .recovery import resolve_session_source
+            session = resolve_session_source(session, self.current_project_dir or Path.cwd())
             source = Path(session.get("source", {}).get("csv_path", ""))
+            if not source.is_file():
+                path, _ = QFileDialog.getOpenFileName(self, "Locate project recording", str(Path.home()), "Event recording (*.csv)")
+                if not path:
+                    self.statusBar().showMessage("Recording not located. The project has been kept.")
+                    return
+                session["source"]["csv_path"] = str(Path(path).resolve())
+                session["source"].setdefault("metadata", {})["csv_path"] = session["source"]["csv_path"]
+                source = Path(path)
             def prepare(cancel, progress):
-                raw = load_events_from_csv(source)
+                raw = self._load_cached_csv(source)
                 if cancel():
                     from .filters import CancelledError
                     raise CancelledError('Session restoration cancelled; previous analysis preserved.')
                 return raw, apply_filters(raw,settings,cancel,progress)
-            self._run_task(prepare,lambda result:self._restore_session(session,result),
+            self._run_task(prepare,lambda result:self._restore_session(session,result,on_restored=on_restored),
                            "Restoring analysis dataset and filters...",cooperative=True)
             return
         raw, filtered = prepared_events if isinstance(prepared_events,tuple) else (prepared_events,apply_filters(prepared_events,settings))
@@ -1307,10 +1634,18 @@ class MainWindow(QMainWindow):
             if previous is not None:
                 self._apply_session(previous, previous_events)
             else:
-                self._reset_view()
+                self._clear_recording()
             self.project_name = previous_name
             self._update_window_title()
             raise
+        from .recovery import session_digest
+        from .project_utils import load_json
+        saved = load_json(session_json_path(self.current_project_dir)) if self.current_project_dir else None
+        self._autosave_baseline = session_digest(saved, self.current_project_dir) if saved else None
+        self._last_autosave_digest = None
+        self.statusBar().showMessage("Session restored. Ctrl+S saves project changes.", 10000)
+        if on_restored:
+            on_restored()
 
     def _apply_session(self, session: dict, prepared_events=None) -> None:
         version = session.get("format_version")
@@ -1335,7 +1670,7 @@ class MainWindow(QMainWindow):
 
         loaded_name = source.get("loaded_name", "") or csv_path.stem
         if prepared_events is None:
-            self._run_task(lambda: load_events_from_csv(csv_path),
+            self._run_task(lambda: self._load_cached_csv(csv_path),
                            lambda events: self._restore_session(session, events), "Restoring full session dataset…")
             return
         expected_hash = source.get("metadata", {}).get("sha256")
@@ -1379,13 +1714,15 @@ class MainWindow(QMainWindow):
             if width <= int(events.x.max()) or height <= int(events.y.max()) or width * height > 16_777_216:
                 raise ValueError("Saved sensor resolution conflicts with event coordinates.")
             events = replace(events, metadata={**events.metadata, **saved_metadata,
-                             "complete": True, "loaded_events": len(events.t), "load_limit": None})
+                             "complete": bool(events.metadata.get("complete", True) and saved_metadata.get("complete", True)),
+                             "loaded_events": len(events.t), "load_limit": saved_metadata.get("load_limit")})
         self._restoring = True
         self.project_name = session.get("project_name", self.project_name)
         self._update_window_title()
         hw = infer_hw(events)
 
         self.events = events
+        self._recording_tools_changed(events)
         self.hw = hw
         if self.filtered_events is not None and prepared_events is not None:
             self.filtered_events=replace(self.filtered_events,metadata={**self.filtered_events.metadata,
@@ -1413,6 +1750,7 @@ class MainWindow(QMainWindow):
         self.window_ms.setEnabled(True)
         self.play_btn.setEnabled(True)
         self.btn_add_slice.setEnabled(True)
+        self._update_file_menu_actions()
 
         self.is_playing = False
         self.play_timer.stop()
@@ -1554,6 +1892,7 @@ class MainWindow(QMainWindow):
         self._update_stats_global()
         self._update_roi_status_label()
 
+        self.edit_history.clear()
         if should_resume_playing:
             self.is_playing = False
             self.play_btn.setText("Play")
@@ -1585,7 +1924,8 @@ class MainWindow(QMainWindow):
 
 
     def _update_timeline_slice_regions(self) -> None:
-        markers = self.detections + self.annotations if self.events is not None else []
+        self.timeline_notes.refresh()
+        markers = self.detections if self.events is not None else []
         self.timeline.set_analysis_markers([
             {"index":i,"start_value":self._time_us_to_slider_value(item['t0']),
              "end_value":self._time_us_to_slider_value(item['t1']),
@@ -1599,6 +1939,8 @@ class MainWindow(QMainWindow):
         regions = []
 
         for i, s in enumerate(self.slices):
+            if s.t1 <= self.zoom_start or s.t0 >= self.zoom_end:
+                continue
             start_v = self._time_us_to_slider_value(s.t0)
             end_v = self._time_us_to_slider_value(s.t1)
             if end_v <= start_v:
@@ -1802,6 +2144,7 @@ class MainWindow(QMainWindow):
 
         self._update_roi_status_label()
 
+    @record_edit("Move / resize ROI")
     def _on_active_roi_moved(self, roi) -> None:
         if not isinstance(roi, Roi):
             return
@@ -1821,23 +2164,86 @@ class MainWindow(QMainWindow):
         self._refresh_analysis_panel()
 
     def _update_roi_status_label(self) -> None:
-        lines = []
-
-        if self._candidate_roi is None:
-            lines.append("Candidate: None (drag on image to create)")
-        else:
+        if self._candidate_roi is not None:
             r = self._candidate_roi
-            lines.append(f"Candidate: x={r.x} y={r.y} w={r.w} h={r.h}")
-
-        if self.active_roi_index is not None and 0 <= self.active_roi_index < len(self.rois):
-            ar = self.rois[self.active_roi_index]
-            rr = ar.roi
-            lines.append(f'Active ROI "{ar.name}": x={rr.x} y={rr.y} w={rr.w} h={rr.h}')
-            lines.append("Tip: drag inside the selected visible ROI to move it or drag a corner handle to resize it.")
+            text = f"New selection: {r.w} x {r.h} px. Right-click to add."
+        elif self.active_roi_index is not None and 0 <= self.active_roi_index < len(self.rois):
+            item = self.rois[self.active_roi_index]
+            r = item.roi
+            text = f"{item.name}: {r.w} x {r.h} px at ({r.x}, {r.y})"
         else:
-            lines.append("Tip: select a visible ROI below, then drag inside it to move it or drag a corner to resize it.")
+            text = "Drag on the image to create an ROI"
+        self.roi_status.setText(text)
+        self.roi_status.setToolTip("Drag a selected visible ROI to move it; drag a corner to resize.")
 
-        self.roi_status.setText("\n".join(lines))
+    def _build_roi_context_menu(self):
+        menu = QMenu(self)
+        selected = 0 <= self.roi_list.currentRow() < len(self.rois)
+        self.btn_add_roi.setEnabled(self._candidate_roi is not None)
+        self.btn_clear_candidate.setEnabled(self._candidate_roi is not None)
+        for action in (self.btn_rename_roi, self.btn_set_roi_color,
+                       self.btn_cycle_roi_color, self.btn_duplicate_roi, self.btn_delete_roi):
+            action.setEnabled(selected)
+        self.btn_export_roi.setEnabled(selected and self.events is not None)
+        self.btn_toggle_analysis.setEnabled(
+            self.analysis_panel.isVisible() or (selected and self.events is not None)
+        )
+        self.btn_clear_all_rois.setEnabled(bool(self.rois))
+        menu.addAction(self.btn_add_roi)
+        menu.addAction(self.btn_clear_candidate)
+        menu.addSeparator()
+        for action in (self.btn_rename_roi, self.btn_duplicate_roi):
+            menu.addAction(action)
+        item = self.roi_list.currentItem()
+        visibility = menu.addAction("Visible")
+        visibility.setCheckable(True)
+        visibility.setEnabled(selected)
+        visibility.setChecked(selected and item.checkState() == Qt.Checked)
+        if selected:
+            visibility.triggered.connect(
+                lambda checked: item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            )
+        colors = menu.addMenu("Color")
+        colors.setEnabled(selected)
+        colors.addAction(self.btn_set_roi_color)
+        colors.addAction(self.btn_cycle_roi_color)
+        menu.addSeparator()
+        menu.addAction(self.btn_export_roi)
+        menu.addAction(self.btn_toggle_analysis)
+        compare = menu.addAction("Compare ROI activity", self._compare_roi_activity)
+        compare.setEnabled(bool(self.rois) and self.events is not None)
+        menu.addSeparator()
+        menu.addAction(self.chk_show_rois)
+        menu.addSeparator()
+        menu.addAction(self.btn_delete_roi)
+        menu.addAction(self.btn_clear_all_rois)
+        return menu
+
+    def _show_roi_context_menu(self, source, position):
+        if source is self.roi_list:
+            item = self.roi_list.itemAt(position)
+            if item is not None:
+                self.roi_list.setCurrentItem(item)
+        elif source in (self.view, self.compare_view):
+            point = source._widget_to_image(position)
+            if point is not None:
+                # Prefer the selected ROI where overlapping layers meet.
+                indices = list(reversed(range(len(self.rois))))
+                if self.active_roi_index in indices:
+                    indices.remove(self.active_roi_index)
+                    indices.insert(0, self.active_roi_index)
+                for index in indices:
+                    layer = self.rois[index]
+                    r = layer.roi
+                    if (self.chk_show_rois.isChecked() and layer.visible
+                            and r.x <= point[0] < r.x + r.w
+                            and r.y <= point[1] < r.y + r.h):
+                        self.roi_list.setCurrentRow(index)
+                        break
+        menu = self._build_roi_context_menu()
+        origin = source.viewport() if source is self.roi_list else source
+        menu.exec(origin.mapToGlobal(position))
+        menu.deleteLater()
 
     def _clear_candidate_roi(self) -> None:
         self._candidate_roi = None
@@ -1845,6 +2251,7 @@ class MainWindow(QMainWindow):
         self.btn_add_roi.setEnabled(False)
         self._update_roi_status_label()
 
+    @record_edit("Add ROI")
     def _add_roi_from_candidate(self) -> None:
         if self._candidate_roi is None:
             return
@@ -1875,6 +2282,7 @@ class MainWindow(QMainWindow):
         self._update_roi_status_label()
         self._refresh_analysis_panel()
 
+    @record_edit("Rename ROI")
     def _rename_selected_roi(self) -> None:
         row = self.roi_list.currentRow()
         if row < 0 or row >= len(self.rois):
@@ -1898,6 +2306,7 @@ class MainWindow(QMainWindow):
         self._update_stats_active_roi(t0, t1)
         self._refresh_analysis_panel()
 
+    @record_edit("Set ROI color")
     def _set_selected_roi_color(self) -> None:
         row = self.roi_list.currentRow()
         if row < 0 or row >= len(self.rois):
@@ -1914,6 +2323,7 @@ class MainWindow(QMainWindow):
         self._push_rois_to_view()
         self._refresh_analysis_panel()
 
+    @record_edit("Change ROI color")
     def _cycle_selected_roi_color(self) -> None:
         row = self.roi_list.currentRow()
         if row < 0 or row >= len(self.rois):
@@ -1932,6 +2342,7 @@ class MainWindow(QMainWindow):
         self._push_rois_to_view()
         self._refresh_analysis_panel()
 
+    @record_edit("Duplicate ROI")
     def _duplicate_selected_roi(self) -> None:
         row = self.roi_list.currentRow()
         if row < 0 or row >= len(self.rois):
@@ -1994,6 +2405,7 @@ class MainWindow(QMainWindow):
             self._export_dialog("Export ROI", roi=item.roi, extra={"roi_id": item.id, "roi_name": item.name})
 
 
+    @record_edit("Delete ROI")
     def _delete_selected_roi(self) -> None:
         row = self.roi_list.currentRow()
         if row < 0 or row >= len(self.rois):
@@ -2029,6 +2441,7 @@ class MainWindow(QMainWindow):
         self._update_roi_status_label()
         self._refresh_analysis_panel()
 
+    @record_edit("Clear ROIs")
     def _clear_all_rois(self) -> None:
         for item in self.slices:
             if item.roi_snapshot is None and item.roi_index is not None and item.roi_index < len(self.rois):
@@ -2068,6 +2481,7 @@ class MainWindow(QMainWindow):
         self._update_roi_status_label()
         self._refresh_analysis_panel()
 
+    @record_edit("Change ROI visibility")
     def _on_roi_item_changed(self, item: QListWidgetItem) -> None:
         row = self.roi_list.row(item)
         if row < 0 or row >= len(self.rois):
@@ -2079,12 +2493,59 @@ class MainWindow(QMainWindow):
         self._refresh_analysis_panel()
 
     def _on_toggle_roi_overlays(self) -> None:
+        history = getattr(self, "edit_history", None)
+        before = history.snapshot() if history is not None and not history.restoring else None
+        if before is not None:
+            before["overlays"] = not self.chk_show_rois.isChecked()
         self.view.set_show_overlays(self.chk_show_rois.isChecked())
         self.compare_view.set_show_overlays(self.chk_show_rois.isChecked())
+        if before is not None:
+            history.commit("Toggle ROI overlays", before)
 
     # =========================================================
     # Slice / loop logic
     # =========================================================
+    def _build_slice_context_menu(self):
+        menu = QMenu(self)
+        selected = 0 <= self.slice_list.currentRow() < len(self.slices)
+        loaded = self.events is not None
+        self.btn_add_slice.setEnabled(loaded)
+        for action in (self.btn_rename_slice, self.btn_set_slice_color, self.btn_delete_slice):
+            action.setEnabled(selected)
+        for action in (self.btn_edit_slice_bounds, self.btn_jump_slice,
+                       self.btn_loop_slice, self.btn_export_slice):
+            action.setEnabled(selected and loaded)
+        self.btn_clear_slices.setEnabled(bool(self.slices))
+        self._update_loop_button_text()
+        menu.addAction(self.btn_add_slice)
+        menu.addSeparator()
+        for action in (self.btn_jump_slice, self.btn_loop_slice, self.btn_edit_slice_bounds):
+            menu.addAction(action)
+        analyze = menu.addAction("Advanced analysis for this slice", self._analyze_selected_slice)
+        analyze.setEnabled(selected and loaded)
+        menu.addSeparator()
+        menu.addAction(self.btn_rename_slice)
+        menu.addAction(self.btn_set_slice_color)
+        menu.addAction(self.btn_export_slice)
+        menu.addSeparator()
+        menu.addAction(self.btn_delete_slice)
+        menu.addAction(self.btn_clear_slices)
+        return menu
+
+    def _show_slice_context_menu(self, source, position):
+        if source is self.slice_list:
+            item = self.slice_list.itemAt(position)
+            if item is not None:
+                self.slice_list.setCurrentItem(item)
+        elif source is self.timeline:
+            index, _ = self.timeline._hit_test_slice(position.x(), position.y())
+            if index is not None:
+                self._on_timeline_slice_selected(index)
+        menu = self._build_slice_context_menu()
+        origin = source.viewport() if source is self.slice_list else source
+        menu.exec(origin.mapToGlobal(position))
+        menu.deleteLater()
+
     def _update_loop_button_text(self) -> None:
         selected_row = self.slice_list.currentRow()
         if selected_row >= 0 and self.loop_slice_index == selected_row:
@@ -2092,6 +2553,7 @@ class MainWindow(QMainWindow):
         else:
             self.btn_loop_slice.setText("Loop Selected Slice")
 
+    @record_edit("Toggle slice loop")
     def _toggle_loop_selected_slice(self) -> None:
         row = self.slice_list.currentRow()
         if row < 0 or row >= len(self.slices):
@@ -2117,6 +2579,7 @@ class MainWindow(QMainWindow):
         self._update_timeline_slice_regions()
         self._update_slice_stats()
 
+    @record_edit("Rename slice")
     def _rename_selected_slice(self) -> None:
         row = self.slice_list.currentRow()
         if row < 0 or row >= len(self.slices):
@@ -2136,6 +2599,7 @@ class MainWindow(QMainWindow):
         self.slice_list.setCurrentRow(row)
         self._update_timeline_slice_regions()
 
+    @record_edit("Set slice color")
     def _set_selected_slice_color(self) -> None:
         row = self.slice_list.currentRow()
         if row < 0 or row >= len(self.slices):
@@ -2156,6 +2620,7 @@ class MainWindow(QMainWindow):
             self.slice_list.setCurrentRow(index)
             self._update_timeline_slice_regions()
 
+    @record_edit("Move / resize slice")
     def _on_timeline_slice_edited(self, index: int, start_value: int, end_value: int) -> None:
         if not (0 <= index < len(self.slices)):
             return
@@ -2182,6 +2647,9 @@ class MainWindow(QMainWindow):
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             it.setCheckState(Qt.Checked if roi_item.visible else Qt.Unchecked)
             it.setIcon(self._make_color_icon(roi_item.color))
+            it.setSizeHint(QSize(0, 34))
+            r = roi_item.roi
+            it.setToolTip(f"{roi_item.name}: {r.w} x {r.h} px at ({r.x}, {r.y})\nCheck to show or hide; right-click for actions.")
             self.roi_list.addItem(it)
 
         if self.active_roi_index is not None and 0 <= self.active_roi_index < len(self.rois):
@@ -2225,6 +2693,8 @@ class MainWindow(QMainWindow):
             ms1 = s.t1 / 1000.0
             it = QListWidgetItem(f'{s.name} | {ms0:.2f}–{ms1:.2f} ms{roi_tag}')
             it.setIcon(self._make_color_icon(s.color))
+            it.setSizeHint(QSize(0, 34))
+            it.setToolTip(f"{s.name}: {ms0:.2f} - {ms1:.2f} ms{roi_tag}\nRight-click for actions. Double-click to jump.")
             self.slice_list.addItem(it)
 
         self.slice_list.blockSignals(False)
@@ -2237,11 +2707,12 @@ class MainWindow(QMainWindow):
 
         self._on_slice_selection_changed()
 
-    def _add_slice_from_current_view(self) -> None:
+    @record_edit("Add slice")
+    def _add_slice_from_current_view(self, bounds=None) -> None:
         if self.events is None:
             return
 
-        t0, t1 = self._current_window()
+        t0, t1 = bounds or self._current_window()
 
         default_name = f"Slice {len(self.slices) + 1}"
         name, ok = QInputDialog.getText(self, "Name slice", "Slice name:", text=default_name)
@@ -2276,7 +2747,8 @@ class MainWindow(QMainWindow):
         if item.filters != self.filter_settings:
             self._apply_filter_settings(item.filters,self._jump_to_selected_slice)
             return
-        self.duration_us = item.t1 - item.t0
+        # Slice bounds describe an analysis interval, not frame exposure.
+        # Preserve the playback window so long slices do not smear motion.
         self.polarity_combo.blockSignals(True)
         self.polarity_combo.setCurrentText(item.polarity)
         self.polarity_combo.blockSignals(False)
@@ -2290,6 +2762,7 @@ class MainWindow(QMainWindow):
         self._update_roi_status_label()
 
 
+    @record_edit("Delete slice")
     def _delete_selected_slice(self) -> None:
         row = self.slice_list.currentRow()
         if row < 0 or row >= len(self.slices):
@@ -2306,6 +2779,7 @@ class MainWindow(QMainWindow):
         self._rebuild_slice_list()
         self._update_timeline_slice_regions()
 
+    @record_edit("Clear slices")
     def _clear_slices(self) -> None:
         self.slices = []
         self.loop_slice_index = None
@@ -2353,6 +2827,18 @@ class MainWindow(QMainWindow):
 
 
     def _reset_view(self) -> None:
+        """Refresh presentation without clearing any loaded project state."""
+        if self.events is None:
+            self.view.update()
+            return
+        self.zoom_start, self.zoom_end = self.t_min, self.t_max + 1
+        self._push_rois_to_view()
+        self._render_from_ui()
+
+    def _clear_recording(self) -> None:
+        """Internal cleanup for an empty import or failed session restoration."""
+        self._recording_tools_changed(None)
+        self.edit_history.clear()
         self.play_timer.stop()
         self.is_playing = False
         self.play_btn.setText("Play")
@@ -2403,7 +2889,7 @@ class MainWindow(QMainWindow):
         self.view_mode_combo.setCurrentText(VIEW_MODE_RAW)
         self.view_mode_combo.blockSignals(False)
 
-        self.view.set_help_text("File → Import .dat to preview")
+        self.view.set_help_text("File → Open recording to begin")
         self.view.set_frame(np.zeros((10, 10), dtype=np.uint8))
 
         self.btn_add_roi.setEnabled(False)
@@ -2422,7 +2908,10 @@ class MainWindow(QMainWindow):
         self.analysis_panel.clear_analysis()
         self._hide_analysis_panel()
 
+        self.timeline_notes.clear_selection()
+
         self._update_roi_status_label()
+        self._update_file_menu_actions()
         self.statusBar().showMessage("Ready")
         if self._workspace is not None:
             self._workspace.clear_results()
@@ -2432,11 +2921,11 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     from .theme import configure_application
-    configure_application(app)
 
-    project_root = Path(__file__).resolve().parents[1]
+    from .paths import storage_root
+    project_root = storage_root()
     projects_root = project_root / "projects"
-    projects_root.mkdir(parents=True, exist_ok=True)
+    browser = None
 
     windows: list[MainWindow] = []
 
@@ -2449,8 +2938,20 @@ def main() -> None:
         windows.append(win)
         win.destroyed.connect(lambda _=None, window=win: windows.remove(window) if window in windows else None)
 
-    browser = ProjectBrowser(projects_root=projects_root, open_project_callback=open_project)
-    _try_show_boot(app, on_done=browser.show)
+    def build_browser():
+        nonlocal browser
+        browser = ProjectBrowser(projects_root=projects_root, open_project_callback=open_project, autoload=False)
+
+    def startup_error(exc):
+        QMessageBox.critical(None, 'Startup failed', str(exc))
+        app.quit()
+
+    _try_show_boot(app, on_done=lambda: browser.show(), on_error=startup_error, steps=[
+        ('Loading interface fonts and colors', lambda: configure_application(app)),
+        ('Preparing local project storage', lambda: projects_root.mkdir(parents=True, exist_ok=True)),
+        ('Building project browser', build_browser),
+        ('Reading saved project metadata', lambda: browser.refresh_projects()),
+    ])
 
     sys.exit(app.exec())
 

@@ -122,9 +122,9 @@ def h5_to_csv_windows(
     return out_csv
 
 
-def load_events_from_csv(csv_path: str | Path, max_events: int | None = None) -> EventBatch:
+def load_events_from_csv(csv_path: str | Path, max_events: int | None = None, *, cancel=None, progress=None) -> EventBatch:
     from .science import load_csv
-    return load_csv(csv_path, max_events)
+    return load_csv(csv_path, max_events, cancel=cancel, progress=progress)
 
 
 def infer_hw(events: EventBatch) -> Tuple[int, int]:

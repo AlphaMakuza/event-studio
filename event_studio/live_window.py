@@ -64,6 +64,8 @@ class LiveWindow(QWidget):
 
     def __init__(self, owner):
         super().__init__(owner, Qt.Window)
+        from .theme import appearance_controller
+        appearance_controller().watch_window(self)
         self.setWindowTitle("Event-Based Studio - Live Camera")
         self.resize(1320, 850)
         self.worker = self.discovery_worker = self.preview_worker = None
@@ -277,6 +279,8 @@ class LiveWindow(QWidget):
         self.view_changed()
         self.empty_view("Looking for connected event cameras...")
         self.update_buttons()
+        from .window_chrome import install_window_header
+        install_window_header(self)
 
     @staticmethod
     def number(low, high, value):

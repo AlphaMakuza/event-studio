@@ -27,11 +27,13 @@ class ROILabel(QWidget):
 
     Interactions:
       - Left-drag on empty area: create candidate ROI
-      - Right-click: clear candidate ROI
+      - Right-click: open ROI actions supplied by the parent window
     """
 
     roiChanged = Signal(object)   # emits Roi | None
     roiMoved = Signal(object)     # emits Roi when active ROI is moved/resized
+    editStarted = Signal()
+    editFinished = Signal()
 
     HANDLE_NONE = 0
     HANDLE_MOVE = 1
@@ -48,7 +50,7 @@ class ROILabel(QWidget):
         self._img_h: int = 0
 
         self._pix: Optional[QPixmap] = None
-        self._help_text: str = "File → Import .dat to preview"
+        self._help_text: str = "File → Open recording to begin"
 
         self._dragging = False
         self._drag_start = QPoint()
@@ -304,8 +306,7 @@ class ROILabel(QWidget):
     # -------------------------
     def mousePressEvent(self, e):
         if e.button() == Qt.RightButton:
-            self.clear_roi()
-            return
+            return  # Preserve the candidate for the context menu.
 
         if e.button() != Qt.LeftButton:
             return
@@ -320,6 +321,7 @@ class ROILabel(QWidget):
 
         hit = self._hit_test_active_roi(pt)
         if hit != self.HANDLE_NONE:
+            self.editStarted.emit()
             self._editing_roi = True
             self._edit_mode = hit
             self._edit_start_img = img_pt
@@ -359,6 +361,7 @@ class ROILabel(QWidget):
 
         if self._editing_roi:
             self._editing_roi = False
+            self.editFinished.emit()
             self._edit_mode = self.HANDLE_NONE
             self._edit_start_img = None
             self._edit_orig_roi = None

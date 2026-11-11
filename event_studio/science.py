@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import csv
+import io
 import hashlib
 import json
 import os
 import re
 import tempfile
 from dataclasses import replace
-from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -41,62 +41,103 @@ def dat_resolution(path):
     return dimensions
 
 
-def load_csv(path, max_events=None):
+def load_csv(path, max_events=None, *, cancel=None, progress=None):
     from .viewer import EventBatch
 
     path = Path(path).resolve()
     if max_events is not None and max_events < 1:
         raise ValueError("Event limit must be positive, or None for the full recording.")
-    # Integer parsing preserves timestamps above float64's exact integer range.
-    blocks, rows, count, complete = [], [], 0, True
-    order = (3, 0, 1, 2)  # Explicit legacy headerless format: x,y,p,t.
+    # Parse ordinary numeric CSV in NumPy, retaining exact integer timestamps.
+    # Compact each block immediately instead of retaining four int64 columns.
+    blocks, lines, count, complete = [], [], 0, True
+    order = (3, 0, 1, 2)
+    size = max(1, path.stat().st_size)
+    numeric = re.compile(r"(?:[ \t]*[+-]?[0-9]+[ \t]*,){3}[ \t]*[+-]?[0-9]+[ \t]*(?:\r?\n|$)")
+    last_t = None
+
+    def check_cancel():
+        if cancel and cancel():
+            from .filters import CancelledError
+            raise CancelledError("Recording import cancelled.")
+
+    def flush(position):
+        nonlocal last_t
+        if not lines:
+            return
+        check_cancel()
+        text = ''.join(lines)
+        try:
+            if len(names) == 4 and numeric.sub('', text) == '':
+                data = np.loadtxt(io.StringIO(text), dtype=np.int64, delimiter=',', ndmin=2)[:, order]
+            else:
+                data = np.array([tuple(int(row[i].strip()) for i in order)
+                                 for row in csv.reader(lines)], dtype=np.int64)
+        except (ValueError, IndexError, OverflowError) as exc:
+            raise ValueError(f"Invalid integer event near CSV event {count:,}: {exc}") from exc
+        if np.any(data[:, 0] < 0) or np.any(data[:, 0] == np.iinfo(np.int64).max):
+            raise ValueError("Timestamp outside supported nonnegative int64 range")
+        if np.any(data[:, 1:3] < 0) or np.any(data[:, 1:3] >= 32768):
+            raise ValueError("Pixel coordinates must be between 0 and 32767")
+        if np.any((data[:, 3] < -1) | (data[:, 3] > 1)):
+            raise ValueError("Polarity must be -1, 0 or 1")
+        if (last_t is not None and data[0, 0] < last_t) or np.any(data[1:, 0] < data[:-1, 0]):
+            raise ValueError("Timestamps must be nondecreasing; source order was not changed.")
+        last_t = int(data[-1, 0])
+        blocks.append([data[:, i].astype(dtype) for i, dtype in enumerate((np.int64, np.int32, np.int32, np.int8))])
+        lines.clear()
+        if progress:
+            progress(min(90, int(position * 90 / size)), f"Reading events: {count:,} ({position / 1048576:.0f} / {size / 1048576:.0f} MB)")
+
     with path.open(encoding="utf-8-sig", newline="") as stream:
-        reader = csv.reader(stream)
-        first = next((r for r in reader if r and not r[0].lstrip().startswith("%")), None)
-        if first is None:
-            raise ValueError("Recording contains no events.")
-        names = [c.strip().lower() for c in first]
+        while True:
+            first = stream.readline()
+            if not first:
+                raise ValueError("Recording contains no events.")
+            if first.strip() and not first.lstrip().startswith('%'):
+                break
+        names = [c.strip().lower() for c in next(csv.reader([first]))]
         header_present = all(c in names for c in ("t", "x", "y", "p"))
         if header_present:
             order = tuple(names.index(c) for c in ("t", "x", "y", "p"))
-            records = reader
         else:
-            records = chain([first], reader)
-        for line, row in enumerate(records, 2):
-            if not row or row[0].lstrip().startswith("%"):
+            lines.append(first if first.endswith('\n') else first + '\n')
+            count = 1
+        while True:
+            line = stream.readline()
+            if not line:
+                break
+            if not line.strip() or line.lstrip().startswith('%'):
                 continue
             if max_events is not None and count == max_events:
                 complete = False
                 break
-            try:
-                t, x, y, p = (int(row[i].strip()) for i in order)
-                if not (0 <= t < np.iinfo(np.int64).max):
-                    raise ValueError("timestamp outside supported nonnegative int64 range")
-                if not (0 <= x < 32768 and 0 <= y < 32768):
-                    raise ValueError("pixel coordinates must be between 0 and 32767")
-                if p not in (-1, 0, 1):
-                    raise ValueError("polarity must be -1, 0 or 1")
-                rows.append((t, x, y, p))
-            except (ValueError, IndexError) as exc:
-                raise ValueError(f"Invalid event near CSV line {line}: {exc}") from exc
+            lines.append(line if line.endswith('\n') else line + '\n')
             count += 1
-            if len(rows) == 65536:
-                blocks.append(np.array(rows, dtype=np.int64))
-                rows = []
-    if rows:
-        blocks.append(np.array(rows, dtype=np.int64))
+            if len(lines) >= 131072:
+                flush(stream.tell())
+        flush(stream.tell())
     if not blocks:
         raise ValueError("Recording contains no events.")
-    data = np.concatenate(blocks) if len(blocks) > 1 else blocks[0]
-    if np.any(data[1:, 0] < data[:-1, 0]):
-        raise ValueError("Timestamps must be nondecreasing; source order was not changed.")
+    check_cancel()
+    if progress:
+        progress(91, "Preparing event arrays...")
+    columns = []
+    for i in range(4):
+        check_cancel()
+        columns.append(np.concatenate([block[i] for block in blocks]) if len(blocks) > 1 else blocks[0][i])
+        for block in blocks:
+            block[i] = None  # Release temporary columns as each final array is ready.
+    del blocks
+    timestamps, xs, ys, polarities = columns
+    if progress:
+        progress(94, "Verifying recording checksum...")
     metadata = {
         "csv_path": str(path), "sha256": fingerprint(path),
         "complete": complete, "loaded_events": count, "load_limit": max_events,
         "timestamp_unit": "us", "sorted": True,
         "header_present": header_present,
         "resolution_origin": "inferred from observed coordinates",
-        "resolution": [int(data[:, 1].max()) + 1, int(data[:, 2].max()) + 1],
+        "resolution": [int(xs.max()) + 1, int(ys.max()) + 1],
     }
     sidecar = path.with_suffix(".json")
     if sidecar.exists():
@@ -104,6 +145,11 @@ def load_csv(path, max_events=None):
             saved = json.loads(sidecar.read_text(encoding="utf-8"))
             if saved.get('csv_sha256') and saved['csv_sha256']!=metadata['sha256']:
                 raise ValueError('CSV content does not match its metadata sidecar hash.')
+            if saved.get('partial_recording'):
+                metadata['complete'] = False
+                metadata['preview'] = True
+                metadata['input_path'] = saved.get('original_path', str(path))
+                metadata['input_sha256'] = saved.get('original_sha256')
             if saved.get('acquisition'):
                 metadata['acquisition']=saved['acquisition']
             if saved.get('selection'):
@@ -123,10 +169,12 @@ def load_csv(path, max_events=None):
     width, height = metadata["resolution"]
     if width <= 0 or height <= 0 or width * height > 16_777_216:
         raise ValueError("Sensor resolution exceeds the supported 16-megapixel image size.")
-    events = EventBatch(data[:, 0].copy(), data[:, 1].astype(np.int32),
-                        data[:, 2].astype(np.int32), data[:, 3].astype(np.int8), metadata)
+    events = EventBatch(timestamps, xs, ys, polarities, metadata)
     for arr in (events.t, events.x, events.y, events.p):
         arr.flags.writeable = False
+    check_cancel()
+    if progress:
+        progress(100, f"Loaded {count:,} events")
     return events
 
 

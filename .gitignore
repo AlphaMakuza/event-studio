@@ -8,3 +8,25 @@ projects/
 *.dat
 .pytest_cache/
 artifacts/
+build/
+dist/
+
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.agents/
+.openai/
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Nested website repository metadata and generated downloads
+website/.git/
+website/dist/downloads/
+website/dist/documents/
+website/dist/assets/
+cloudflare-site/dist/

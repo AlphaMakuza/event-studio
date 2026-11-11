@@ -16,6 +16,8 @@ def analyze_batch(
     *,
     bin_us=1000,
     threshold=100.0,
+    min_burst_us=1,
+    polarity="both",
     filters=None,
     rois=None,
     expected_hw=None,
@@ -62,9 +64,10 @@ def analyze_batch(
                 if cancelled():
                     raise CancelledError("Batch cancelled")
                 roi = Roi(**probe["roi"]) if probe.get("roi") else None
-                series = recording.activity(start, end, bin_us, roi)
-                bursts = detect_bursts(series, threshold)
-                stats = recording.statistics(start, end, roi)
+                series = recording.activity(start, end, bin_us, roi, polarity)
+                bursts = detect_bursts(series, threshold, min_burst_us)
+                stats = recording.statistics(start, end, roi, polarity)
+                area = roi.w * roi.h if roi else recording.resolution[0] * recording.resolution[1]
                 destination = output / f"{i:04d}_{j:03d}_activity.csv"
                 export_table(
                     destination,
@@ -94,6 +97,8 @@ def analyze_batch(
                         "events": stats.n_events,
                         "duration_us": stats.duration_us,
                         "events_per_ms": stats.events_per_ms,
+                        "area_pixels": area,
+                        "events_per_ms_per_pixel": stats.events_per_ms / area,
                         "bursts": len(bursts),
                         "measurement_csv": destination.name,
                     }
@@ -108,6 +113,8 @@ def analyze_batch(
         "parameters": {
             "bin_us": bin_us,
             "threshold_events_per_ms": threshold,
+            "min_burst_us": min_burst_us,
+            "polarity": polarity,
             "filters": filters or {},
             "rois": rois,
             "expected_hw": expected_hw,
@@ -124,6 +131,8 @@ def analyze_batch(
             "events",
             "duration_us",
             "events_per_ms",
+            "area_pixels",
+            "events_per_ms_per_pixel",
             "bursts",
             "error",
         ],
@@ -137,6 +146,8 @@ def analyze_batch(
                     "events",
                     "duration_us",
                     "events_per_ms",
+                    "area_pixels",
+                    "events_per_ms_per_pixel",
                     "bursts",
                     "error",
                 )
