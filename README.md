@@ -1,5 +1,7 @@
 # Event-Based Studio
 
+**[Download here](https://website.ebstudio.workers.dev/)**
+
 View and analyse event-camera recordings. Inspect motion, compare regions,
 and export measurements.
 
@@ -13,11 +15,11 @@ and export measurements.
 </details>
 
 Website snapshots captured November 10, 2026.
-[Image credits](docs/screenshots/PHOTO-CREDITS.txt) ?
+[Image credits](docs/screenshots/PHOTO-CREDITS.txt) |
 [Footage credits](docs/screenshots/FOOTAGE-CREDITS.txt).
 
-[Setup and development](DEVELOPMENT.md) ?
-[Download guide](docs/DOWNLOAD.md) ?
+[Setup and development](DEVELOPMENT.md) |
+[Download guide](docs/DOWNLOAD.md) |
 [Release notes](docs/RELEASE-NOTES.md)
 
-Copyright ? 2026 Alpha Makuza. Proprietary software; see [license](LICENSE.txt).
+Copyright (c) 2026 Alpha Makuza. Proprietary software; see [license](LICENSE.txt).
